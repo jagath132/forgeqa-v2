@@ -1,0 +1,2030 @@
+import { handleV2Routes } from './v2/router.js';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import multer from 'multer';
+import { connectDb, getDb, isMongoUriConfigured } from './db.js';
+import { createKnowledgeService } from './knowledge/service.js';
+import { createKnowledgeStore } from './storage/index.js';
+import {
+  buildQaPrompt,
+  buildQaRefinementPrompt,
+  generateWithGemini,
+  generateWithGeminiStream,
+  parseSafeJson,
+} from './ai/gemini.js';
+import { generateWithOpenAI, generateWithOpenAIStream } from './ai/openai.js';
+import { supportsEmbeddings } from './ai/embeddings.js';
+import {
+  buildTraceability,
+  deduplicateTestCases,
+  embedTestCases,
+  extractRequirements,
+  normalizeGherkinSteps,
+} from './ai/qa.js';
+import {
+  generateTestScript,
+  generateFrameworkProject,
+  generatePlaywrightFramework,
+  diagnoseTestFailure,
+} from './test-scripts/generator.js';
+import { generateRegressionScripts } from './regression/scripts.js';
+import { crawlWebApp } from './prd/crawler.js';
+import {
+  buildPrdPromptFromText,
+  buildPrdPromptFromCrawl,
+  generatePrdStream,
+} from './prd/generator.js';
+import { convertMarkdownToDocx } from './prd/export.js';
+import {
+  storeBuildArtifact,
+  getLatestBuild,
+  saveWebhook,
+  getWebhooks,
+} from './regression/builds.js';
+import { createRun, listRuns, getRun } from './regression/runs.js';
+import {
+  authStore,
+  authenticateToken,
+  handleAuthRoute,
+  decryptApiKey,
+  findProductKeyByUserId,
+  logAudit,
+} from './auth/index.js';
+import { sendSupportEmail } from './email/index.js';
+import {
+  getAlertsForUser,
+  dismissAlert,
+  dismissAllAlerts,
+  checkUserProviderModel,
+} from './ai/modelHealthCheck.js';
+import {
+  MODEL_REGISTRY,
+  getRegistryDefault,
+  normalizeModelId,
+  resolveDeprecated,
+} from './ai/modelRegistry.js';
+import { resolveLiveModel } from './ai/modelSync.js';
+import {
+  completeConnectorOAuth,
+  createAuthorizationUrl,
+  disconnectConnector,
+  getConnectorConnection,
+  getConnectorStatuses,
+  saveConnectorSettings,
+  syncConnectorDocuments,
+} from './knowledge/connectors.js';
+
+const ALLOWED_EXTENSIONS = [
+  '.apk',
+  '.aab',
+  '.zip',
+  '.html',
+  '.js',
+  '.css',
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.svg',
+  '.ico',
+  '.json',
+  '.txt',
+  '.md',
+  '.markdown',
+  '.pdf',
+  '.csv',
+  '.xlsx',
+  '.docx',
+  '.pptx',
+];
+
+function isSampleTcId(id) {
+  if (typeof id !== 'string') return false;
+  return /^TC_(00[1-9]|01[0-2]|HIST_\d+)$/.test(id);
+}
+
+function isSampleQaResultData(data) {
+  if (!data || typeof data !== 'object') return false;
+  if (data.summary === 'User Authentication & Registration — Test Matrix') return true;
+  if (Array.isArray(data.testCases) && data.testCases.some((tc) => isSampleTcId(tc?.tcId))) {
+    return true;
+  }
+  return false;
+}
+
+function filterSampleHistoryItems(items) {
+  if (!Array.isArray(items)) return [];
+  return items.filter((item) => {
+    if (!item) return false;
+    if (typeof item.id === 'string' && item.id.startsWith('TEST_HIST_')) return false;
+    if (isSampleQaResultData(item.result)) return false;
+    return true;
+  });
+}
+
+function filterSampleSuites(suites) {
+  if (!Array.isArray(suites)) return [];
+  return suites.filter((s) => {
+    if (!s) return false;
+    if (['auth_suite', 'checkout_suite', 'settings_suite'].includes(s.id)) return false;
+    if (Array.isArray(s.caseIds) && s.caseIds.some((id) => isSampleTcId(id))) return false;
+    return true;
+  });
+}
+
+function fileFilter(_req, file, cb) {
+  const ext = path.extname(file.originalname).toLowerCase();
+  if (ALLOWED_EXTENSIONS.includes(ext)) return cb(null, true);
+  cb(new Error(`File type "${ext}" is not allowed.`));
+}
+
+const uploadDir = process.env.VERCEL ? '/tmp/uploads' : path.resolve('.data/uploads');
+const upload = multer({
+  dest: uploadDir,
+  limits: {
+    fileSize: 25 * 1024 * 1024,
+    files: 12,
+  },
+  fileFilter,
+});
+
+function corsify(res, req) {
+  const origin = req?.headers?.origin || '*';
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  if (origin !== '*') res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+}
+
+function sendJson(res, statusCode, payload) {
+  res.statusCode = statusCode;
+  res.setHeader('Content-Type', 'application/json');
+  res.end(JSON.stringify(payload));
+}
+
+function readRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    let size = 0;
+    const MAX_SIZE = 1024 * 512;
+
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > MAX_SIZE) {
+        req.destroy(new Error('Request body too large'));
+        return;
+      }
+      body += chunk;
+    });
+
+    req.on('end', () => resolve(body));
+    req.on('error', reject);
+  });
+}
+
+function parseUrl(req) {
+  return new URL(req.url, 'http://localhost');
+}
+
+const providerEnvKeyMap = {
+  gemini: 'GEMINI_API_KEY',
+  openai: 'OPENAI_API_KEY',
+  openrouter: 'OPENROUTER_API_KEY',
+  claude: 'CLAUDE_API_KEY',
+  opencode: 'OPENCODE_API_KEY',
+  groq: 'GROQ_API_KEY',
+};
+
+/**
+ * Resolves the model to use for a request.
+ *
+ * Resolution order (fastest → most authoritative):
+ *  1. Synchronous: if the model is marked deprecated in the static registry,
+ *     instantly redirect to its replacement (no DB needed).
+ *  2. Async: delegate to resolveLiveModel() which checks the live model list
+ *     fetched from the provider's API and stored in MongoDB.
+ *     - If the model is still live → use it.
+ *     - If it was removed → auto-pick the best available replacement.
+ *  3. Static fallback if the DB isn't ready yet.
+ *
+ * Result: any model change by any provider is handled automatically with
+ * zero code changes — just wait for the next 24-hour sync.
+ */
+async function resolveModel(provider, model) {
+  const effective = normalizeModelId(model) || getRegistryDefault(provider);
+  if (!effective) return undefined;
+
+  // Fast path: static registry says it's deprecated → redirect immediately
+  const staticReplacement = resolveDeprecated(provider, effective);
+  if (staticReplacement) {
+    console.warn(
+      `[ModelRegistry] "${effective}" is deprecated for "${provider}". Redirecting to "${staticReplacement}".`
+    );
+    return staticReplacement;
+  }
+
+  // Slow path: check live availability from the last sync
+  return resolveLiveModel(provider, effective);
+}
+
+async function resolveApiKey(provider, requestApiKey, env, userId) {
+  const trimmedRequestKey = String(requestApiKey || '').trim();
+  if (trimmedRequestKey) {
+    return trimmedRequestKey;
+  }
+  if (userId) {
+    try {
+      const dbKey = await authStore.getEncryptedApiKey(userId, provider);
+      if (dbKey) {
+        const decrypted = decryptApiKey(dbKey.encryptedKey, dbKey.iv, dbKey.authTag);
+        if (decrypted && decrypted.trim()) {
+          return decrypted.trim();
+        }
+      }
+    } catch (err) {
+      console.error('Error retrieving API key from database:', err);
+    }
+  }
+  return env?.[providerEnvKeyMap[provider]] || process.env[providerEnvKeyMap[provider]] || '';
+}
+
+async function resolveEmbeddingOptions(provider, apiKey, env, userId) {
+  if (supportsEmbeddings(provider)) return { provider, apiKey };
+  const openAiKey = await resolveApiKey('openai', null, env, userId);
+  return openAiKey ? { provider: 'openai', apiKey: openAiKey } : null;
+}
+
+async function finalizeQaResult(
+  result,
+  requirement,
+  embeddingOptions,
+  threshold,
+  format = 'standard'
+) {
+  const requirements = extractRequirements(requirement);
+  const warnings = Array.isArray(result.warnings) ? result.warnings : [];
+  const cases =
+    format === 'gherkin' ? normalizeGherkinSteps(result.testCases ?? []) : result.testCases;
+  const embeddings = embeddingOptions ? await embedTestCases(cases, embeddingOptions) : null;
+  if (!embeddings) {
+    warnings.push(
+      'Embedding-based similarity merging is unavailable for the selected provider. Configure Gemini, OpenAI, or OpenRouter embeddings.'
+    );
+  }
+  const testCases = deduplicateTestCases(cases, embeddings, threshold);
+  return {
+    ...result,
+    testCases,
+    requirements,
+    traceability: buildTraceability(requirements, testCases),
+    ...(warnings.length ? { warnings } : {}),
+  };
+}
+
+async function cleanupFiles(files = []) {
+  await Promise.all(files.map((file) => fs.unlink(file.path).catch(() => undefined)));
+}
+
+export function createApiMiddleware(env = {}) {
+  if (env && typeof env === 'object') {
+    for (const [k, v] of Object.entries(env)) {
+      if (v !== undefined && v !== null && v !== '' && !process.env[k]) {
+        process.env[k] = String(v);
+      }
+    }
+  }
+
+  let store;
+  let knowledge;
+
+  // Readiness must be self-healing: a failed connect attempt resets the cached
+  // promise so the next request retries, instead of latching a rejected
+  // promise and answering 503 "Database not connected" until restart.
+  let dbReady = null;
+  let lastDbError = null;
+  let nextDbAttemptAt = 0;
+  const DB_RETRY_COOLDOWN_MS = 2000;
+
+  function getDbReady() {
+    if (dbReady) return dbReady;
+    if (lastDbError && Date.now() < nextDbAttemptAt) {
+      // Fail fast while cooling down so a down database isn't hammered.
+      return Promise.reject(lastDbError);
+    }
+    nextDbAttemptAt = Date.now() + DB_RETRY_COOLDOWN_MS;
+
+    dbReady = connectDb()
+      .then(async () => {
+        // Connection is live — stop failing fast with the stale error.
+        lastDbError = null;
+        try {
+          store = createKnowledgeStore();
+          knowledge = createKnowledgeService(store, env);
+          const { seedPlans } = await import('./billing/plans.js');
+          await seedPlans();
+
+          const plansDb = getDb();
+          const defaults = [
+            {
+              id: 'free',
+              name: 'Free',
+              price: 0,
+              currency: 'inr',
+              period: 'monthly',
+              description: 'Get started with essential testing tools at no cost.',
+              features: [
+                '100 test cases/month',
+                '1 AI provider',
+                'Basic reporting',
+                'Community support',
+                '1 user',
+              ],
+              popular: false,
+              active: true,
+              sortOrder: 1,
+              maxUsers: 1,
+              maxTestCases: 100,
+              aiProviders: 1,
+              advancedExport: false,
+              regressionTesting: false,
+              prioritySupport: false,
+              customIntegrations: false,
+              onPremise: false,
+            },
+            {
+              id: 'pro',
+              name: 'Pro',
+              price: 99900,
+              currency: 'inr',
+              period: 'monthly',
+              description: 'For teams that need advanced testing and analytics.',
+              features: [
+                'Unlimited test cases',
+                '5 AI providers',
+                'Advanced reporting & export',
+                'Regression testing',
+                'Email support',
+                'Up to 10 users',
+              ],
+              popular: true,
+              active: true,
+              sortOrder: 2,
+              maxUsers: 10,
+              maxTestCases: null,
+              aiProviders: 5,
+              advancedExport: true,
+              regressionTesting: true,
+              prioritySupport: false,
+              customIntegrations: false,
+              onPremise: false,
+            },
+            {
+              id: 'enterprise',
+              name: 'Enterprise',
+              price: 0,
+              currency: 'inr',
+              period: 'monthly',
+              description: 'Custom solutions for large organizations. Contact us for pricing.',
+              features: [
+                'Everything in Pro',
+                'Unlimited users',
+                'All AI providers',
+                'Custom integrations',
+                'On-premise deployment',
+                'Priority support',
+                'Dedicated account manager',
+                'SLA guarantee',
+              ],
+              popular: false,
+              active: true,
+              sortOrder: 3,
+              maxUsers: null,
+              maxTestCases: null,
+              aiProviders: null,
+              advancedExport: true,
+              regressionTesting: true,
+              prioritySupport: true,
+              customIntegrations: true,
+              onPremise: true,
+            },
+          ];
+          for (const plan of defaults) {
+            await plansDb.collection('plans').updateOne(
+              { id: plan.id },
+              {
+                $set: { ...plan, updatedAt: new Date().toISOString() },
+                $setOnInsert: { createdAt: new Date().toISOString() },
+              },
+              { upsert: true }
+            );
+          }
+        } catch (setupErr) {
+          // Setup/seeding must not mark the database unavailable: the connection
+          // is live, so serve requests and retry the setup on the next request.
+          dbReady = null;
+          console.error('Post-connect setup failed (will retry):', setupErr.message || setupErr);
+        }
+      })
+      .catch((err) => {
+        dbReady = null;
+        lastDbError = err;
+        console.error('Failed to connect to MongoDB:', err.message || err);
+        throw err;
+      });
+
+    return dbReady;
+  }
+
+  // Start connecting immediately: startup background jobs (model sync, health
+  // check) call getDb() before the first request arrives. If this attempt
+  // fails, getDbReady() retries on the next request.
+  getDbReady().catch(() => {});
+
+  return async function apiMiddleware(req, res, next) {
+    const url = parseUrl(req);
+
+    corsify(res, req);
+
+    if (req.method === 'OPTIONS') {
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+
+    // ForgeQA v2.0 Modular Route Dispatcher
+    if (url.pathname.startsWith('/api/bugs') || url.pathname.startsWith('/api/api-client') || url.pathname.startsWith('/api/security/scan') || url.pathname.startsWith('/api/v2/assistant')) {
+      const handled = handleV2Routes(req, res, url, body);
+      if (handled) return;
+    }
+
+    if (!url.pathname.startsWith('/api/')) {
+      next();
+      return;
+    }
+
+    // 0a. Healthcheck — always responds immediately, no DB needed
+    if (url.pathname === '/api/health' && req.method === 'GET') {
+      sendJson(res, 200, { status: 'ok', uptime: process.uptime() });
+      return;
+    }
+
+    try {
+      await getDbReady();
+    } catch (dbError) {
+      const uriConfigured = isMongoUriConfigured();
+      console.error(
+        'MongoDB not ready:',
+        dbError.message || dbError,
+        '| MONGO_URI configured:',
+        uriConfigured
+      );
+      res.setHeader('Retry-After', '5');
+      if (!uriConfigured) {
+        // Be explicit: without a database URL no retry can ever succeed, so
+        // say what to fix instead of pretending it is transient.
+        sendJson(res, 503, {
+          error:
+            'Server configuration error: the database URL (MONGO_URI) is not set on this server.',
+          code: 'db_not_configured',
+        });
+      } else {
+        sendJson(res, 503, {
+          error: 'Database not connected. Please try again.',
+          code: 'db_unreachable',
+        });
+      }
+      return;
+    }
+
+    try {
+      // 0b. Plans lookup — public (used during registration flow)
+      if (url.pathname === '/api/plans' && req.method === 'GET') {
+        const db = getDb();
+        const plans = await db
+          .collection('plans')
+          .find({ active: true })
+          .sort({ sortOrder: 1 })
+          .toArray();
+        sendJson(res, 200, { plans: plans.map((p) => ({ ...p, id: p.id })) });
+        return;
+      }
+
+      // 1. Try auth routes (register, login, forgot-password, reset-password, /me, api-keys)
+      const matched = await handleAuthRoute(req, res, url);
+      if (matched) return;
+
+      if (url.pathname === '/api/knowledge/connectors/oauth/callback' && req.method === 'GET') {
+        const appUrl = process.env.APP_URL || 'http://127.0.0.1:5173';
+        try {
+          const code = url.searchParams.get('code');
+          const state = url.searchParams.get('state');
+          if (!code || !state || url.searchParams.has('error')) {
+            throw new Error('Authorization was cancelled.');
+          }
+          const completed = await completeConnectorOAuth({ code, state, authStore });
+          res.writeHead(302, {
+            Location: `${appUrl}/knowledge?connector=${encodeURIComponent(completed.provider)}&connected=1`,
+          });
+          res.end();
+        } catch (error) {
+          console.error('Knowledge connector OAuth failed:', error.message);
+          res.writeHead(302, {
+            Location: `${appUrl}/knowledge?connector_error=1`,
+          });
+          res.end();
+        }
+        return;
+      }
+
+      // 1b. Payment routes (unauthenticated — part of registration flow)
+      if (url.pathname === '/api/payments/create-checkout' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const { pendingId, plan, email } = JSON.parse(rawBody || '{}');
+        if (!pendingId || !plan || !email) {
+          sendJson(res, 400, { error: 'pendingId, plan, and email are required.' });
+          return;
+        }
+        try {
+          const { createCheckoutSession } = await import('./payments/stripe.js');
+          const result = await createCheckoutSession({ pendingId, email, plan });
+          sendJson(res, 200, result);
+        } catch (err) {
+          sendJson(res, 400, { error: err.message });
+        }
+        return;
+      }
+
+      if (url.pathname === '/api/payments/create-order' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const { pendingId, plan, email } = JSON.parse(rawBody || '{}');
+        if (!pendingId || !plan || !email) {
+          sendJson(res, 400, { error: 'pendingId, plan, and email are required.' });
+          return;
+        }
+        try {
+          const { createRazorpayOrder } = await import('./payments/razorpay.js');
+          const result = await createRazorpayOrder({ pendingId, email, plan });
+          sendJson(res, 200, result);
+        } catch (err) {
+          sendJson(res, 400, { error: err.message });
+        }
+        return;
+      }
+
+      if (
+        (url.pathname === '/api/payments/stripe-webhook' ||
+          url.pathname === '/api/billing/webhook') &&
+        req.method === 'POST'
+      ) {
+        const { handleBillingWebhook } = await import('./billing/webhooks.js');
+        await handleBillingWebhook(req, res);
+        return;
+      }
+
+      if (url.pathname === '/api/billing/plans' && req.method === 'GET') {
+        const { handleBillingRoute } = await import('./billing/routes.js');
+        await handleBillingRoute(req, res, url, null);
+        return;
+      }
+
+      // 2. All remaining /api/* routes require authentication
+      let user;
+      try {
+        user = await authenticateToken(req);
+      } catch (authError) {
+        sendJson(res, authError.statusCode || 401, { error: authError.message });
+        return;
+      }
+
+      const syncKnowledgeConnector = async (provider) => {
+        const connection = await getConnectorConnection(authStore, user.id, provider);
+        if (!connection) throw new Error('Connect this account before syncing.');
+        const documents = await syncConnectorDocuments(provider, connection.access_token);
+        const { checkPlanLimit } = await import('./billing/usage.js');
+        const savedFiles = await knowledge.syncConnector(provider, documents, user.id, {
+          beforeCreate: async () => {
+            const limitCheck = await checkPlanLimit(user.id, 'knowledgeFiles', 1);
+            if (!limitCheck.allowed) {
+              const error = new Error(limitCheck.reason);
+              error.statusCode = 429;
+              throw error;
+            }
+          },
+        });
+        const settingsKey = `knowledge-connector-settings:${provider}`;
+        const settings = (await authStore.loadUserData(user.id, settingsKey)) ?? {};
+        await authStore.saveUserData(user.id, settingsKey, {
+          ...settings,
+          lastSyncAt: new Date().toISOString(),
+        });
+
+        let indexedChunkCount = 0;
+        if (savedFiles.length && ['gemini', 'openai', 'openrouter'].includes(user.activeProvider)) {
+          const embeddingApiKey = await resolveApiKey(user.activeProvider, null, env, user.id);
+          if (embeddingApiKey) {
+            const result = await knowledge.refreshChunks(user.id, {
+              provider: user.activeProvider,
+              apiKey: embeddingApiKey,
+            });
+            indexedChunkCount = result.chunkCount;
+          }
+        }
+        return {
+          provider,
+          documentCount: savedFiles.length,
+          indexedChunkCount,
+          indexingRequired: savedFiles.length > 0 && indexedChunkCount === 0,
+        };
+      };
+
+      if (url.pathname === '/api/knowledge/connectors' && req.method === 'GET') {
+        const connectors = await getConnectorStatuses(authStore, user.id);
+        sendJson(res, 200, { connectors });
+        return;
+      }
+
+      if (url.pathname === '/api/knowledge/connectors/sync-due' && req.method === 'POST') {
+        const connectors = await getConnectorStatuses(authStore, user.id);
+        const synced = [];
+        const errors = [];
+        for (const connector of connectors) {
+          if (!connector.connected || connector.autoSyncMinutes <= 0) continue;
+          const lastSync = connector.lastSyncAt ? Date.parse(connector.lastSyncAt) : 0;
+          if (Date.now() - lastSync < connector.autoSyncMinutes * 60_000) continue;
+          try {
+            synced.push(await syncKnowledgeConnector(connector.id));
+          } catch (error) {
+            errors.push({ provider: connector.id, message: error.message });
+          }
+        }
+        sendJson(res, 200, { synced, errors });
+        return;
+      }
+
+      const connectorMatch = url.pathname.match(
+        /^\/api\/knowledge\/connectors\/(confluence|notion|googleDrive|github)(?:\/(authorize|sync|settings))?$/
+      );
+      if (connectorMatch) {
+        const [, connectorProvider, action] = connectorMatch;
+        if (action === 'authorize' && req.method === 'POST') {
+          sendJson(res, 200, {
+            authorizationUrl: createAuthorizationUrl(connectorProvider, user.id),
+          });
+          return;
+        }
+        if (action === 'sync' && req.method === 'POST') {
+          sendJson(res, 200, await syncKnowledgeConnector(connectorProvider));
+          return;
+        }
+        if (action === 'settings' && req.method === 'POST') {
+          const rawBody = await readRequestBody(req);
+          const { autoSyncMinutes } = JSON.parse(rawBody || '{}');
+          await saveConnectorSettings(authStore, user.id, connectorProvider, autoSyncMinutes);
+          sendJson(res, 200, { ok: true });
+          return;
+        }
+        if (!action && req.method === 'DELETE') {
+          await disconnectConnector(authStore, user.id, connectorProvider);
+          sendJson(res, 200, { ok: true });
+          return;
+        }
+      }
+
+      // Admin routes (require Admin role)
+      if (url.pathname.startsWith('/api/admin/')) {
+        if (user.role !== 'Admin') {
+          sendJson(res, 403, { error: 'Admin access required.' });
+          return;
+        }
+        const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+        if (url.pathname === '/api/admin/users' && req.method === 'GET') {
+          const db = getDb();
+          const users = await db
+            .collection('users')
+            .find({}, { projection: { passwordHash: 0, salt: 0 } })
+            .sort({ createdAt: -1 })
+            .toArray();
+          sendJson(res, 200, {
+            users: users.map((u) => ({
+              id: u._id.toString(),
+              email: u.email,
+              role: u.role || 'Member',
+              createdAt: u.createdAt,
+              subscriptionTier: u.subscriptionTier || 'free',
+            })),
+          });
+          return;
+        }
+        if (url.pathname === '/api/admin/stats' && req.method === 'GET') {
+          const db = getDb();
+          const [userCount, keyCount, usedKeys, deletedCount] = await Promise.all([
+            db.collection('users').countDocuments(),
+            db.collection('product_keys').countDocuments(),
+            db.collection('product_keys').countDocuments({ status: 'used' }),
+            db.collection('deleted_users').countDocuments(),
+          ]);
+          sendJson(res, 200, {
+            userCount,
+            keyCount,
+            usedKeys,
+            availableKeys: keyCount - usedKeys,
+            deletedCount,
+          });
+          return;
+        }
+        if (url.pathname.match(/^\/api\/admin\/users\/([a-f0-9]+)$/) && req.method === 'PUT') {
+          const id = url.pathname.split('/').pop();
+          const rawBody = await readRequestBody(req);
+          const { role } = JSON.parse(rawBody || '{}');
+          if (!['Admin', 'Member'].includes(role)) {
+            sendJson(res, 400, { error: 'Invalid role.' });
+            return;
+          }
+          const { ObjectId } = await import('mongodb');
+          const db = getDb();
+          await db.collection('users').updateOne({ _id: new ObjectId(id) }, { $set: { role } });
+          await logAudit({
+            adminId: user.id,
+            adminEmail: user.email,
+            action: 'update_role',
+            resource: 'user',
+            resourceId: id,
+            details: { role },
+            ip: clientIp,
+          });
+          sendJson(res, 200, { ok: true });
+          return;
+        }
+        if (url.pathname === '/api/admin/audit-logs' && req.method === 'GET') {
+          const { getAuditLogs } = await import('./audit/index.js');
+          const logs = await getAuditLogs({ limit: 200 });
+          sendJson(res, 200, { logs });
+          return;
+        }
+        if (url.pathname === '/api/admin/unlock' && req.method === 'POST') {
+          const rawBody = await readRequestBody(req);
+          const { email } = JSON.parse(rawBody || '{}');
+          if (!email) {
+            sendJson(res, 400, { error: 'Email is required.' });
+            return;
+          }
+          const { clearLockout } = await import('./rate-limit/index.js');
+          await clearLockout(`login:${email.toLowerCase()}`);
+          await logAudit({
+            adminId: user.id,
+            adminEmail: user.email,
+            action: 'unlock_account',
+            resource: 'user',
+            details: { email },
+            ip: clientIp,
+          });
+          sendJson(res, 200, { ok: true });
+          return;
+        }
+        if (url.pathname === '/api/admin/billing/plans' && req.method === 'GET') {
+          const { getDb } = await import('./db.js');
+          const plans = await getDb().collection('subscription_plans').find({}).toArray();
+          sendJson(res, 200, { plans: plans.map((p) => ({ ...p, id: p._id.toString() })) });
+          return;
+        }
+        if (
+          url.pathname.match(/^\/api\/admin\/users\/([a-f0-9]+)\/subscription$/) &&
+          req.method === 'PUT'
+        ) {
+          const id = url.pathname.split('/').pop();
+          const rawBody = await readRequestBody(req);
+          const { tier, status } = JSON.parse(rawBody || '{}');
+          const { updateSubscription } = await import('./billing/plans.js');
+          await updateSubscription(id, tier, status);
+          await logAudit({
+            adminId: user.id,
+            adminEmail: user.email,
+            action: 'update_subscription',
+            resource: 'user',
+            resourceId: id,
+            details: { tier, status },
+            ip: clientIp,
+          });
+          sendJson(res, 200, { ok: true });
+          return;
+        }
+        sendJson(res, 404, { error: 'Admin route not found.' });
+        return;
+      }
+
+      // Billing & Subscription Routes
+      if (url.pathname.startsWith('/api/billing/')) {
+        const { handleBillingRoute } = await import('./billing/routes.js');
+        const handled = await handleBillingRoute(req, res, url, user);
+        if (handled) return;
+      }
+
+      if (url.pathname === '/api/billing/calculate-price' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const {
+          seats = 1,
+          tier = 'enterprise',
+          billingCycle = 'monthly',
+        } = JSON.parse(rawBody || '{}');
+        const { calculatePrice } = await import('./billing/pricing.js');
+        const priceInfo = calculatePrice(seats, tier, billingCycle);
+        sendJson(res, 200, priceInfo);
+        return;
+      }
+
+      if (url.pathname === '/api/payments/create-portal-session' && req.method === 'POST') {
+        const { handleCustomerPortal } = await import('./payments/portal.js');
+        req.user = user;
+        await handleCustomerPortal(req, res);
+        return;
+      }
+
+      if (url.pathname === '/api/knowledge/files' && req.method === 'GET') {
+        const files = await knowledge.listFiles(url.searchParams.get('search') ?? '', user.id);
+        sendJson(res, 200, { files, storageMode: store.mode });
+        return;
+      }
+
+      if (url.pathname === '/api/knowledge/upload' && req.method === 'POST') {
+        const { checkPlanLimit } = await import('./billing/usage.js');
+        const limitCheck = await checkPlanLimit(user.id, 'knowledgeFiles', 1);
+        if (!limitCheck.allowed) {
+          sendJson(res, 429, { error: limitCheck.reason, code: 'LIMIT_EXCEEDED' });
+          return;
+        }
+
+        await fs.mkdir(uploadDir, { recursive: true });
+
+        upload.array('files')(req, res, async (error) => {
+          if (error) {
+            sendJson(res, 400, { error: error.message });
+            return;
+          }
+
+          try {
+            const files = req.files ?? [];
+            const processed = [];
+
+            for (const file of files) {
+              processed.push(await knowledge.processUpload(file, user.id));
+            }
+
+            await cleanupFiles(files);
+            sendJson(res, 200, { files: processed });
+          } catch (uploadError) {
+            await cleanupFiles(req.files ?? []);
+            sendJson(res, uploadError.statusCode ?? 500, {
+              error: uploadError.message ?? 'Unable to process upload.',
+            });
+          }
+        });
+        return;
+      }
+
+      if (url.pathname.startsWith('/api/knowledge/files/') && req.method === 'DELETE') {
+        const id = decodeURIComponent(url.pathname.split('/').pop());
+        await knowledge.deleteFile(id, user.id);
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (url.pathname === '/api/knowledge/sharepoint' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const { url: sharePointUrl } = JSON.parse(rawBody || '{}');
+
+        if (!sharePointUrl) {
+          sendJson(res, 400, { error: 'SharePoint URL is required.' });
+          return;
+        }
+
+        const file = await knowledge.processSharePointUrl(sharePointUrl, user.id);
+        sendJson(res, 200, { file });
+        return;
+      }
+
+      if (url.pathname === '/api/knowledge/search' && req.method === 'GET') {
+        const query = url.searchParams.get('q') ?? '';
+        const fileId = url.searchParams.get('fileId') || null;
+        const limit = Number(url.searchParams.get('limit') || '50');
+        const provider = user.activeProvider;
+        const apiKey = provider ? await resolveApiKey(provider, null, env, user.id) : '';
+        const embeddingOptions = await resolveEmbeddingOptions(provider, apiKey, env, user.id);
+        const chunks = await knowledge.searchChunks(query, limit, user.id, fileId, {
+          ...(embeddingOptions ?? {}),
+        });
+        sendJson(res, 200, { chunks });
+        return;
+      }
+
+      if (url.pathname === '/api/knowledge/chunks/refresh' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const { provider: requestedProvider } = JSON.parse(rawBody || '{}');
+        const provider = requestedProvider || user.activeProvider;
+        if (!provider) {
+          sendJson(res, 400, { error: 'Select an AI provider before creating embeddings.' });
+          return;
+        }
+        const apiKey = await resolveApiKey(provider, null, env, user.id);
+        if (!apiKey) {
+          sendJson(res, 400, { error: `Missing ${provider} API key. Configure it in Settings.` });
+          return;
+        }
+        const result = await knowledge.refreshChunks(user.id, { provider, apiKey });
+        sendJson(res, 200, result);
+        return;
+      }
+
+      if (url.pathname === '/api/generate-test-cases' && req.method === 'POST') {
+        const { checkPlanLimit, incrementAiGenerations } = await import('./billing/usage.js');
+        const limitCheck = await checkPlanLimit(user.id, 'aiGenerations', 1);
+        if (!limitCheck.allowed) {
+          sendJson(res, 429, { error: limitCheck.reason, code: 'LIMIT_EXCEEDED' });
+          return;
+        }
+
+        const rawBody = await readRequestBody(req);
+        const {
+          requirement,
+          apiKey: requestApiKey,
+          model,
+          provider,
+          format,
+          techniques,
+          similarityThreshold,
+        } = JSON.parse(rawBody || '{}');
+        if (!provider) {
+          sendJson(res, 400, { error: 'provider is required.' });
+          return;
+        }
+        const apiKey = await resolveApiKey(provider, requestApiKey, env, user.id);
+
+        if (!apiKey) {
+          sendJson(res, 500, {
+            error: `Missing ${provider} API key. Provide it in settings or env.`,
+          });
+          return;
+        }
+
+        if (!requirement || requirement.trim().length < 10) {
+          sendJson(res, 400, { error: 'Requirement text must be at least 10 characters.' });
+          return;
+        }
+
+        const requirements = extractRequirements(requirement);
+        const embeddingOptions = await resolveEmbeddingOptions(provider, apiKey, env, user.id);
+        const chunks = await knowledge.searchChunks(requirement, 4, user.id, null, {
+          ...(embeddingOptions ?? {}),
+        });
+        const defaultModel = await resolveModel(provider, model);
+        const promptOptions = {
+          format: format === 'gherkin' ? 'gherkin' : 'standard',
+          techniques: Array.isArray(techniques) ? techniques : [],
+          requirements,
+        };
+        let result;
+
+        if (provider === 'gemini') {
+          result = await generateWithGemini({
+            apiKey,
+            prompt: buildQaPrompt(requirement, chunks, promptOptions),
+            model: defaultModel,
+          });
+        } else if (
+          provider === 'openai' ||
+          provider === 'openrouter' ||
+          provider === 'opencode' ||
+          provider === 'groq'
+        ) {
+          const endpoint =
+            provider === 'openrouter'
+              ? 'https://openrouter.ai/api/v1/chat/completions'
+              : provider === 'groq'
+                ? 'https://api.groq.com/openai/v1/chat/completions'
+                : 'https://api.openai.com/v1/chat/completions';
+
+          const responseText = await generateWithOpenAI({
+            apiKey,
+            prompt: buildQaPrompt(requirement, chunks, promptOptions),
+            model: defaultModel,
+            endpoint,
+            provider,
+          });
+          result = parseSafeJson(responseText);
+        } else {
+          sendJson(res, 501, { error: `${provider} support is not implemented yet.` });
+          return;
+        }
+
+        result = await finalizeQaResult(
+          result,
+          requirement,
+          embeddingOptions,
+          similarityThreshold,
+          promptOptions.format
+        );
+        await incrementAiGenerations(user.id);
+
+        sendJson(res, 200, {
+          ...result,
+          format: promptOptions.format,
+          knowledgeContext: chunks.map((chunk) => ({
+            fileName: chunk.file_name,
+            chunkText: chunk.chunk_text,
+            score: chunk.score,
+          })),
+        });
+        return;
+      }
+
+      if (url.pathname === '/api/generate-test-cases/refine' && req.method === 'POST') {
+        const { checkPlanLimit, incrementAiGenerations } = await import('./billing/usage.js');
+        const limitCheck = await checkPlanLimit(user.id, 'aiGenerations', 1);
+        if (!limitCheck.allowed) {
+          sendJson(res, 429, { error: limitCheck.reason, code: 'LIMIT_EXCEEDED' });
+          return;
+        }
+        const rawBody = await readRequestBody(req);
+        const {
+          requirement,
+          instruction,
+          testCases,
+          summary,
+          knowledgeContext = [],
+          conversation = [],
+          apiKey: requestApiKey,
+          model,
+          provider,
+          format,
+          similarityThreshold,
+        } = JSON.parse(rawBody || '{}');
+        if (!provider) {
+          sendJson(res, 400, { error: 'provider is required.' });
+          return;
+        }
+        if (!requirement || !Array.isArray(testCases) || !testCases.length) {
+          sendJson(res, 400, { error: 'An existing test matrix and requirement are required.' });
+          return;
+        }
+        if (!instruction || !instruction.trim()) {
+          sendJson(res, 400, { error: 'A refinement instruction is required.' });
+          return;
+        }
+        const apiKey = await resolveApiKey(provider, requestApiKey, env, user.id);
+        if (!apiKey) {
+          sendJson(res, 500, {
+            error: `Missing ${provider} API key. Provide it in settings or env.`,
+          });
+          return;
+        }
+
+        const defaultModel = await resolveModel(provider, model);
+        const prompt = buildQaRefinementPrompt(requirement, testCases, instruction, {
+          format: format === 'gherkin' ? 'gherkin' : 'standard',
+          requirements: extractRequirements(requirement),
+          conversation: Array.isArray(conversation) ? conversation : [],
+        });
+        let result;
+        if (provider === 'gemini') {
+          result = await generateWithGemini({ apiKey, prompt, model: defaultModel });
+        } else if (
+          provider === 'openai' ||
+          provider === 'openrouter' ||
+          provider === 'opencode' ||
+          provider === 'groq'
+        ) {
+          const endpoint =
+            provider === 'openrouter'
+              ? 'https://openrouter.ai/api/v1/chat/completions'
+              : provider === 'groq'
+                ? 'https://api.groq.com/openai/v1/chat/completions'
+                : 'https://api.openai.com/v1/chat/completions';
+          result = parseSafeJson(
+            await generateWithOpenAI({
+              apiKey,
+              prompt,
+              model: defaultModel,
+              endpoint,
+              provider,
+            })
+          );
+        } else {
+          sendJson(res, 501, { error: `${provider} support is not implemented yet.` });
+          return;
+        }
+        result = await finalizeQaResult(
+          result,
+          requirement,
+          await resolveEmbeddingOptions(provider, apiKey, env, user.id),
+          similarityThreshold,
+          format === 'gherkin' ? 'gherkin' : 'standard'
+        );
+        await incrementAiGenerations(user.id);
+        sendJson(res, 200, {
+          ...result,
+          format: format === 'gherkin' ? 'gherkin' : 'standard',
+          knowledgeContext,
+          summary: result.summary || summary,
+        });
+        return;
+      }
+
+      if (url.pathname === '/api/generate-test-cases/stream' && req.method === 'POST') {
+        const { checkPlanLimit, incrementAiGenerations } = await import('./billing/usage.js');
+        const limitCheck = await checkPlanLimit(user.id, 'aiGenerations', 1);
+        if (!limitCheck.allowed) {
+          sendJson(res, 429, { error: limitCheck.reason, code: 'LIMIT_EXCEEDED' });
+          return;
+        }
+        const rawBody = await readRequestBody(req);
+        const {
+          requirement,
+          apiKey: requestApiKey,
+          model,
+          provider,
+          format,
+          techniques,
+          similarityThreshold,
+        } = JSON.parse(rawBody || '{}');
+        if (!provider) {
+          sendJson(res, 400, { error: 'provider is required.' });
+          return;
+        }
+        const apiKey = await resolveApiKey(provider, requestApiKey, env, user.id);
+
+        if (!apiKey) {
+          sendJson(res, 500, {
+            error: `Missing ${provider} API key. Provide it in settings or env.`,
+          });
+          return;
+        }
+
+        if (!requirement || requirement.trim().length < 10) {
+          sendJson(res, 400, { error: 'Requirement text must be at least 10 characters.' });
+          return;
+        }
+
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+          'X-Accel-Buffering': 'no',
+        });
+
+        const sendSSE = (event, data) => {
+          res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+        };
+
+        sendSSE('phase', { phase: 'knowledge', message: 'Searching knowledge base...' });
+
+        const requirements = extractRequirements(requirement);
+        const embeddingOptions = await resolveEmbeddingOptions(provider, apiKey, env, user.id);
+        const chunks = await knowledge.searchChunks(requirement, 4, user.id, null, {
+          ...(embeddingOptions ?? {}),
+        });
+
+        sendSSE('phase', { phase: 'prompt', message: 'Building RAG prompt...' });
+
+        const prompt = buildQaPrompt(requirement, chunks, {
+          format: format === 'gherkin' ? 'gherkin' : 'standard',
+          techniques: Array.isArray(techniques) ? techniques : [],
+          requirements,
+        });
+        const defaultModel = await resolveModel(provider, model);
+
+        sendSSE('phase', { phase: 'generating', message: 'Requesting AI model...' });
+
+        let fullText = '';
+
+        try {
+          if (provider === 'gemini') {
+            await generateWithGeminiStream({
+              apiKey,
+              prompt,
+              model: defaultModel,
+              onToken: (token) => {
+                fullText += token;
+                sendSSE('token', { token });
+              },
+            });
+          } else if (
+            provider === 'openai' ||
+            provider === 'openrouter' ||
+            provider === 'opencode' ||
+            provider === 'groq'
+          ) {
+            const endpoint =
+              provider === 'openrouter'
+                ? 'https://openrouter.ai/api/v1/chat/completions'
+                : provider === 'groq'
+                  ? 'https://api.groq.com/openai/v1/chat/completions'
+                  : 'https://api.openai.com/v1/chat/completions';
+
+            await generateWithOpenAIStream({
+              apiKey,
+              prompt,
+              model: defaultModel,
+              endpoint,
+              onToken: (token) => {
+                fullText += token;
+                sendSSE('token', { token });
+              },
+            });
+          } else {
+            sendSSE('error', { error: `${provider} streaming is not supported yet.` });
+            res.end();
+            return;
+          }
+
+          const result = await finalizeQaResult(
+            parseSafeJson(fullText),
+            requirement,
+            embeddingOptions,
+            similarityThreshold,
+            format === 'gherkin' ? 'gherkin' : 'standard'
+          );
+          await incrementAiGenerations(user.id);
+
+          sendSSE('complete', {
+            ...result,
+            format: format === 'gherkin' ? 'gherkin' : 'standard',
+            knowledgeContext: chunks.map((chunk) => ({
+              fileName: chunk.file_name,
+              chunkText: chunk.chunk_text,
+              score: chunk.score,
+            })),
+          });
+        } catch (error) {
+          sendSSE('error', { error: error.message || 'Generation failed.' });
+        }
+
+        res.end();
+        return;
+      }
+
+      if (url.pathname === '/api/generate-test-scripts' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const {
+          framework,
+          language,
+          targetUrl,
+          options,
+          testCaseIds,
+          testCases,
+          apiKey: requestApiKey,
+          model,
+          provider,
+        } = JSON.parse(rawBody || '{}');
+        if (!provider) {
+          sendJson(res, 400, { error: 'provider is required.' });
+          return;
+        }
+
+        const apiKey = await resolveApiKey(provider, requestApiKey, env, user.id);
+
+        if (!apiKey) {
+          sendJson(res, 500, {
+            error: `Missing ${provider} API key. Provide it in settings or env.`,
+          });
+          return;
+        }
+
+        if (!framework || !language || !targetUrl || !Array.isArray(testCases)) {
+          sendJson(res, 400, {
+            error: 'framework, language, targetUrl and testCases are required.',
+          });
+          return;
+        }
+
+        const selectedTestCases =
+          Array.isArray(testCaseIds) && testCaseIds.length
+            ? testCases.filter((testCase) => testCaseIds.includes(testCase.tcId))
+            : testCases;
+
+        if (!selectedTestCases.length) {
+          sendJson(res, 400, {
+            error: 'At least one valid test case is required to generate a script.',
+          });
+          return;
+        }
+
+        const result = await generateTestScript({
+          apiKey,
+          provider,
+          framework,
+          language,
+          targetUrl,
+          options,
+          testCases: selectedTestCases,
+          model: await resolveModel(provider, model),
+        });
+
+        sendJson(res, 200, result);
+        return;
+      }
+
+      // === Multi-Framework Production Framework Generator ===
+      if (url.pathname === '/api/test-scripts/generate-framework' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const {
+          apiKey: requestApiKey,
+          provider: requestProvider,
+          framework: requestFramework,
+          language: requestLanguage,
+          targetUrl,
+          testCases,
+          testCaseIds,
+          options,
+          model,
+        } = JSON.parse(rawBody || '{}');
+
+        const provider = requestProvider || 'gemini';
+        const apiKey = await resolveApiKey(provider, requestApiKey, env, user.id);
+
+        if (!apiKey) {
+          sendJson(res, 400, {
+            error: `API key is required for provider "${provider}". Configure it in Settings or your environment.`,
+          });
+          return;
+        }
+
+        if (!Array.isArray(testCases) || !testCases.length) {
+          sendJson(res, 400, { error: 'testCases array is required.' });
+          return;
+        }
+
+        const selectedTestCases =
+          Array.isArray(testCaseIds) && testCaseIds.length
+            ? testCases.filter((testCase) => testCaseIds.includes(testCase.tcId))
+            : testCases;
+
+        if (!selectedTestCases.length) {
+          sendJson(res, 400, {
+            error: 'At least one valid test case is required to generate the framework.',
+          });
+          return;
+        }
+
+        const result = await generateFrameworkProject({
+          apiKey,
+          provider,
+          framework: requestFramework || 'playwright',
+          language: requestLanguage || 'typescript',
+          targetUrl: targetUrl || 'https://example.com',
+          options,
+          testCases: selectedTestCases,
+          model: await resolveModel(provider, model),
+        });
+
+        sendJson(res, 200, result);
+        return;
+      }
+
+      // === AI Test Failure Diagnostics & Self-Healing ===
+      if (url.pathname === '/api/test-scripts/ai-diagnose' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const {
+          apiKey: requestApiKey,
+          provider: requestProvider,
+          errorLog,
+          failedLocator,
+          targetUrl,
+          testCaseSummary,
+          model,
+        } = JSON.parse(rawBody || '{}');
+
+        const provider = requestProvider || 'gemini';
+        const apiKey = await resolveApiKey(provider, requestApiKey, env, user.id);
+
+        if (!apiKey) {
+          sendJson(res, 400, {
+            error: `API key is required for provider "${provider}". Configure it in Settings or your environment.`,
+          });
+          return;
+        }
+
+        if (!errorLog) {
+          sendJson(res, 400, { error: 'errorLog is required for failure diagnosis.' });
+          return;
+        }
+
+        const diagnosis = await diagnoseTestFailure({
+          apiKey,
+          provider,
+          errorLog,
+          failedLocator,
+          targetUrl,
+          testCaseSummary,
+          model: await resolveModel(provider, model),
+        });
+
+        sendJson(res, 200, diagnosis);
+        return;
+      }
+
+      // === PRD Generator endpoints ===
+
+      if (url.pathname === '/api/prd/generate-from-text' && req.method === 'POST') {
+        const { checkPlanLimit, incrementAiGenerations } = await import('./billing/usage.js');
+        const limitCheck = await checkPlanLimit(user.id, 'aiGenerations', 1);
+        if (!limitCheck.allowed) {
+          sendJson(res, 429, { error: limitCheck.reason, code: 'LIMIT_EXCEEDED' });
+          return;
+        }
+
+        const rawBody = await readRequestBody(req);
+        const {
+          productName,
+          moduleName,
+          details,
+          apiKey: requestApiKey,
+          model,
+          provider,
+        } = JSON.parse(rawBody || '{}');
+
+        if (!details || details.trim().length < 15) {
+          sendJson(res, 400, {
+            error: 'Please provide at least 15 characters of product details.',
+          });
+          return;
+        }
+
+        const targetProvider = provider || user.activeProvider || 'gemini';
+        const apiKey = await resolveApiKey(targetProvider, requestApiKey, env, user.id);
+        if (!apiKey) {
+          sendJson(res, 500, {
+            error: `Missing ${targetProvider} API key. Please configure it in Settings or env.`,
+          });
+          return;
+        }
+
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+          'X-Accel-Buffering': 'no',
+        });
+
+        const sendSSE = (event, data) => {
+          res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+        };
+
+        sendSSE('phase', {
+          phase: 'analyzing',
+          message: 'Analyzing product context & requirements...',
+        });
+
+        const prompt = buildPrdPromptFromText({ productName, moduleName, details });
+        const defaultModel = await resolveModel(targetProvider, model);
+
+        sendSSE('phase', {
+          phase: 'generating',
+          message: 'Generating comprehensive PRD document...',
+        });
+
+        let fullText = '';
+        try {
+          await generatePrdStream({
+            apiKey,
+            provider: targetProvider,
+            model: defaultModel,
+            prompt,
+            onToken: (token) => {
+              fullText += token;
+              sendSSE('token', { token });
+            },
+          });
+
+          await incrementAiGenerations(user.id);
+          sendSSE('complete', { prdText: fullText });
+        } catch (error) {
+          sendSSE('error', { error: error.message || 'PRD generation failed.' });
+        }
+
+        res.end();
+        return;
+      }
+
+      if (url.pathname === '/api/prd/generate-from-url' && req.method === 'POST') {
+        const { checkPlanLimit, incrementAiGenerations } = await import('./billing/usage.js');
+        const limitCheck = await checkPlanLimit(user.id, 'aiGenerations', 1);
+        if (!limitCheck.allowed) {
+          sendJson(res, 429, { error: limitCheck.reason, code: 'LIMIT_EXCEEDED' });
+          return;
+        }
+
+        const rawBody = await readRequestBody(req);
+        const {
+          url: targetUrl,
+          email,
+          password,
+          focus,
+          apiKey: requestApiKey,
+          model,
+          provider,
+        } = JSON.parse(rawBody || '{}');
+
+        if (!targetUrl || targetUrl.trim().length < 4) {
+          sendJson(res, 400, { error: 'Please provide a valid application URL to explore.' });
+          return;
+        }
+
+        const targetProvider = provider || user.activeProvider || 'gemini';
+        const apiKey = await resolveApiKey(targetProvider, requestApiKey, env, user.id);
+        if (!apiKey) {
+          sendJson(res, 500, {
+            error: `Missing ${targetProvider} API key. Please configure it in Settings or env.`,
+          });
+          return;
+        }
+
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+          'X-Accel-Buffering': 'no',
+        });
+
+        const sendSSE = (event, data) => {
+          res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+        };
+
+        let fullText = '';
+        try {
+          sendSSE('phase', {
+            phase: 'crawling',
+            message: 'Exploring application & inspecting UI hierarchies...',
+          });
+
+          const crawlReport = await crawlWebApp({
+            url: targetUrl,
+            email,
+            password,
+            focus,
+            maxPages: 20,
+          });
+
+          sendSSE('phase', {
+            phase: 'analyzing',
+            message: `Discovered ${crawlReport.totalPagesExplored} pages. Synthesizing features & flows...`,
+          });
+
+          const prompt = buildPrdPromptFromCrawl(crawlReport);
+          const defaultModel = await resolveModel(targetProvider, model);
+
+          sendSSE('phase', {
+            phase: 'generating',
+            message: 'Generating comprehensive PRD document...',
+          });
+
+          await generatePrdStream({
+            apiKey,
+            provider: targetProvider,
+            model: defaultModel,
+            prompt,
+            onToken: (token) => {
+              fullText += token;
+              sendSSE('token', { token });
+            },
+          });
+
+          await incrementAiGenerations(user.id);
+          sendSSE('complete', { prdText: fullText, crawlReport });
+        } catch (error) {
+          sendSSE('error', { error: error.message || 'URL exploration & PRD generation failed.' });
+        }
+
+        res.end();
+        return;
+      }
+
+      if (url.pathname === '/api/prd/save-to-knowledge' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const { prdText, fileName } = JSON.parse(rawBody || '{}');
+
+        if (!prdText || !prdText.trim()) {
+          sendJson(res, 400, { error: 'PRD text is empty.' });
+          return;
+        }
+
+        const safeFileName = fileName
+          ? `${fileName.replace(/\.md$/i, '')}.md`
+          : `PRD-${new Date().toISOString().slice(0, 10)}.md`;
+
+        try {
+          const file = await knowledge.saveExtractedKnowledge(
+            {
+              fileName: safeFileName,
+              fileType: 'txt',
+              sourceType: 'upload',
+              text: prdText,
+              pageCount: 1,
+            },
+            user.id
+          );
+
+          const provider = user.activeProvider;
+          const apiKey = provider ? await resolveApiKey(provider, null, env, user.id) : '';
+          if (!provider || !apiKey) {
+            sendJson(res, 400, {
+              error: 'Select an AI provider and configure its API key before indexing this PRD.',
+            });
+            return;
+          }
+          const refreshResult = await knowledge.refreshChunks(user.id, { provider, apiKey });
+          sendJson(res, 200, { ok: true, file, chunkCount: refreshResult.chunkCount });
+        } catch (kbError) {
+          sendJson(res, 500, { error: kbError.message || 'Failed to save PRD to Knowledge Base.' });
+        }
+        return;
+      }
+
+      if (url.pathname === '/api/prd/export' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const { prdText, fileName = 'PRD' } = JSON.parse(rawBody || '{}');
+
+        if (!prdText || !prdText.trim()) {
+          sendJson(res, 400, { error: 'PRD text is empty.' });
+          return;
+        }
+
+        try {
+          const buffer = await convertMarkdownToDocx(prdText, fileName);
+          const safeName = `${fileName.replace(/[^a-zA-Z0-9_-]/g, '_')}.docx`;
+
+          res.writeHead(200, {
+            'Content-Type':
+              'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'Content-Disposition': `attachment; filename="${safeName}"`,
+            'Content-Length': buffer.length,
+          });
+          res.end(buffer);
+        } catch (docxErr) {
+          sendJson(res, 500, { error: `DOCX generation failed: ${docxErr.message}` });
+        }
+        return;
+      }
+
+
+      // === Regression Testing endpoints ===
+
+      if (url.pathname === '/api/regression/generate' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const {
+          requirement,
+          testCases,
+          platform,
+          apiKey: requestApiKey,
+          model,
+          provider,
+        } = JSON.parse(rawBody || '{}');
+        if (!provider) {
+          sendJson(res, 400, { error: 'provider is required.' });
+          return;
+        }
+        const apiKey = await resolveApiKey(provider, requestApiKey, env, user.id);
+        if (!apiKey) {
+          sendJson(res, 500, { error: `Missing ${provider} API key.` });
+          return;
+        }
+        if (!requirement || requirement.trim().length < 10) {
+          sendJson(res, 400, { error: 'Requirement text must be at least 10 characters.' });
+          return;
+        }
+        const result = await generateRegressionTestCases({
+          apiKey,
+          provider,
+          requirement,
+          existingTestCases: testCases,
+          platform: platform || 'web',
+          model: await resolveModel(provider, model),
+        });
+        sendJson(res, 200, { testCases: result?.testCases || [], summary: result?.summary || '' });
+        return;
+      }
+
+      if (url.pathname === '/api/regression/scripts' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const {
+          testCases,
+          platform,
+          framework,
+          language,
+          targetUrl,
+          apiKey: requestApiKey,
+          model,
+          provider,
+        } = JSON.parse(rawBody || '{}');
+        if (!provider) {
+          sendJson(res, 400, { error: 'provider is required.' });
+          return;
+        }
+        const apiKey = await resolveApiKey(provider, requestApiKey, env, user.id);
+        if (!apiKey) {
+          sendJson(res, 500, { error: `Missing ${provider} API key.` });
+          return;
+        }
+        if (!Array.isArray(testCases) || !testCases.length) {
+          sendJson(res, 400, { error: 'At least one test case is required.' });
+          return;
+        }
+        const fw = framework || (platform === 'mobile' ? 'appium' : 'playwright');
+        const lang = language || 'typescript';
+        const result = await generateRegressionScripts({
+          apiKey,
+          provider,
+          testCases,
+          platform: platform || 'web',
+          framework: fw,
+          language: lang,
+          targetUrl: targetUrl || 'http://localhost:3000',
+          model: await resolveModel(provider, model),
+        });
+        sendJson(res, 200, { scripts: [result] });
+        return;
+      }
+
+      if (url.pathname === '/api/regression/runs' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const data = JSON.parse(rawBody || '{}');
+        const run = await createRun(user.id, data);
+        sendJson(res, 200, run);
+        return;
+      }
+
+      if (url.pathname === '/api/regression/runs' && req.method === 'GET') {
+        const runs = await listRuns(user.id);
+        sendJson(res, 200, { runs });
+        return;
+      }
+
+      if (url.pathname.startsWith('/api/regression/runs/') && req.method === 'GET') {
+        const runId = url.pathname.split('/').pop();
+        const run = await getRun(user.id, runId);
+        if (!run) {
+          sendJson(res, 404, { error: 'Run not found.' });
+          return;
+        }
+        sendJson(res, 200, run);
+        return;
+      }
+
+      if (
+        url.pathname.startsWith('/api/regression/runs/') &&
+        req.method === 'POST' &&
+        url.pathname.endsWith('/execute')
+      ) {
+        const segments = url.pathname.split('/');
+        const runId = segments[segments.length - 2];
+        const run = await getRun(user.id, runId);
+        if (!run) {
+          sendJson(res, 404, { error: 'Run not found.' });
+          return;
+        }
+        sendJson(res, 501, {
+          error:
+            'Regression test execution is not configured. No tests were run and no results were recorded.',
+        });
+        return;
+      }
+
+      if (url.pathname === '/api/regression/builds/upload' && req.method === 'POST') {
+        await fs.mkdir(uploadDir, { recursive: true });
+        upload.single('file')(req, res, async (error) => {
+          if (error) {
+            sendJson(res, 400, { error: error.message });
+            return;
+          }
+          try {
+            const { platform, version } = req.body;
+            if (!platform || !version) {
+              sendJson(res, 400, { error: 'platform and version are required.' });
+              return;
+            }
+            const artifact = await storeBuildArtifact(user.id, platform, version, req.file);
+            sendJson(res, 200, artifact);
+          } catch (uploadError) {
+            sendJson(res, 500, { error: uploadError.message });
+          }
+        });
+        return;
+      }
+
+      if (url.pathname.startsWith('/api/regression/builds/latest/') && req.method === 'GET') {
+        const platform = url.pathname.split('/').pop();
+        const artifact = await getLatestBuild(user.id, platform);
+        sendJson(res, 200, { artifact });
+        return;
+      }
+
+      if (url.pathname === '/api/regression/builds/webhook' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const { platform, url: webhookUrl } = JSON.parse(rawBody || '{}');
+        if (!platform || !webhookUrl) {
+          sendJson(res, 400, { error: 'platform and url are required.' });
+          return;
+        }
+        await saveWebhook(user.id, platform, webhookUrl);
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (url.pathname === '/api/regression/builds/webhook' && req.method === 'GET') {
+        const webhooks = await getWebhooks(user.id);
+        sendJson(res, 200, { webhooks });
+        return;
+      }
+
+      // === User Data endpoints (profile, team, suites, history, qaResult) ===
+
+      if (url.pathname === '/api/user/profile' && req.method === 'GET') {
+        const data = await authStore.loadUserData(user.id, 'profile');
+        sendJson(res, 200, { profile: data || { displayName: '' } });
+        return;
+      }
+
+      if (url.pathname === '/api/user/profile' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const { displayName } = JSON.parse(rawBody || '{}');
+        await authStore.saveUserData(user.id, 'profile', { displayName: displayName || '' });
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (url.pathname === '/api/user/product-key' && req.method === 'GET') {
+        const keyDoc = await findProductKeyByUserId(user.id);
+        sendJson(res, 200, {
+          productKey: keyDoc ? { key: keyDoc.key, activatedAt: keyDoc.usedAt } : null,
+        });
+        return;
+      }
+
+      if (url.pathname === '/api/user/team' && req.method === 'GET') {
+        const data = await authStore.loadUserData(user.id, 'team');
+        sendJson(res, 200, { members: data || [] });
+        return;
+      }
+
+      if (url.pathname === '/api/user/team' && req.method === 'POST') {
+        if (user.role !== 'Admin') {
+          sendJson(res, 403, { error: 'Only admins can manage team.' });
+          return;
+        }
+        const rawBody = await readRequestBody(req);
+        const { members } = JSON.parse(rawBody || '{}');
+        await authStore.saveUserData(user.id, 'team', members || []);
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (url.pathname === '/api/user/suites' && req.method === 'GET') {
+        const raw = await authStore.loadUserData(user.id, 'suites');
+        const data = filterSampleSuites(raw);
+        sendJson(res, 200, { suites: data || [] });
+        return;
+      }
+
+      if (url.pathname === '/api/user/suites' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const { suites } = JSON.parse(rawBody || '{}');
+        await authStore.saveUserData(user.id, 'suites', filterSampleSuites(suites));
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (url.pathname === '/api/history' && req.method === 'GET') {
+        const raw = await authStore.loadUserData(user.id, 'history');
+        const data = filterSampleHistoryItems(raw);
+        sendJson(res, 200, { items: data || [] });
+        return;
+      }
+
+      if (url.pathname === '/api/history' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const { items } = JSON.parse(rawBody || '{}');
+        await authStore.saveUserData(user.id, 'history', filterSampleHistoryItems(items));
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (url.pathname === '/api/qa-result' && req.method === 'GET') {
+        const data = await authStore.loadUserData(user.id, 'qaResult');
+        const cleanData = isSampleQaResultData(data) ? null : data;
+        sendJson(res, 200, { result: cleanData || null });
+        return;
+      }
+
+      if (url.pathname === '/api/qa-result' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const { result } = JSON.parse(rawBody || '{}');
+        const cleanResult = isSampleQaResultData(result) ? null : result;
+        await authStore.saveUserData(user.id, 'qaResult', cleanResult || null);
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      // Landing page enterprise inquiry (no pending registration needed)
+      if (url.pathname === '/api/enterprise-inquiry' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const { name, email, company, message } = JSON.parse(rawBody || '{}');
+        if (!name || !email || !company || !message) {
+          sendJson(res, 400, { error: 'All fields are required.' });
+          return;
+        }
+        const db = getDb();
+        await db.collection('enterprise_inquiries').insertOne({
+          name,
+          email,
+          company,
+          message,
+          source: 'landing_page',
+          createdAt: new Date().toISOString(),
+        });
+        try {
+          await sendSupportEmail({
+            name,
+            email,
+            subject: `Enterprise Inquiry from ${company}`,
+            message: `Company: ${company}\n\nMessage:\n${message}`,
+          });
+        } catch (emailErr) {
+          console.warn('Failed to send enterprise inquiry email:', emailErr.message);
+        }
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      // ── AI Model Alert endpoints ────────────────────────────────────────────
+
+      // GET /api/ai/model-alerts — returns unseen deprecation alerts for current user
+      if (url.pathname === '/api/ai/model-alerts' && req.method === 'GET') {
+        const alerts = await getAlertsForUser(user.id);
+        sendJson(res, 200, { alerts });
+        return;
+      }
+
+      // POST /api/ai/model-alerts/:id/dismiss — dismiss one alert
+      if (/^\/api\/ai\/model-alerts\/[^/]+\/dismiss$/.test(url.pathname) && req.method === 'POST') {
+        const alertId = url.pathname.split('/')[4];
+        await dismissAlert(user.id, alertId);
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      // POST /api/ai/model-alerts/dismiss-all
+      if (url.pathname === '/api/ai/model-alerts/dismiss-all' && req.method === 'POST') {
+        await dismissAllAlerts(user.id);
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      // GET /api/ai/model-registry — full registry for frontend model pickers
+      if (url.pathname === '/api/ai/model-registry' && req.method === 'GET') {
+        sendJson(res, 200, { registry: MODEL_REGISTRY });
+        return;
+      }
+
+      // POST /api/ai/check-model — live-probe the user's current provider + model
+      // Body: { provider, model } — both optional, defaults from registry
+      if (url.pathname === '/api/ai/check-model' && req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        const { provider: reqProvider, model: reqModel } = JSON.parse(rawBody || '{}');
+        const provider = reqProvider || user.activeProvider;
+        if (!provider) {
+          sendJson(res, 400, { error: 'No provider specified or configured.' });
+          return;
+        }
+        const model = reqModel || getRegistryDefault(provider);
+        let encryptedKey = null;
+        try {
+          encryptedKey = await authStore.getEncryptedApiKey(user.id, provider);
+        } catch {
+          // no key stored — registry-only check
+        }
+        const newAlerts = await checkUserProviderModel(user.id, {
+          provider,
+          model,
+          encryptedKey,
+          liveProbe: true,
+        });
+        const alerts = await getAlertsForUser(user.id);
+        sendJson(res, 200, { alerts, newAlerts });
+        return;
+      }
+
+      sendJson(res, 404, { error: 'API route not found.' });
+    } catch (error) {
+      console.error('API error encountered:', error);
+      console.error('Request URL:', req.url);
+      if (error.stack) console.error('Stack:', error.stack.split('\n').slice(0, 4).join('\n'));
+
+      const userMessage =
+        error.statusCode && error.statusCode < 500
+          ? (error.message ?? 'Request failed.')
+          : 'An internal error occurred. Please try again later.';
+
+      sendJson(res, error.statusCode ?? 500, {
+        error: userMessage,
+      });
+    }
+  };
+}

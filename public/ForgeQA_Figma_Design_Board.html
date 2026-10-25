@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ForgeQA — Figma Design Canvas (All 11 Modules)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-canvas: #090B0E;
+      --bg-panel: #11141B;
+      --bg-surface: #171B24;
+      --border-color: rgba(255, 255, 255, 0.08);
+      --accent-amber: #F5A623;
+      --accent-teal: #00D4C8;
+      --accent-red: #FF4D4F;
+      --text-primary: #F3F4F6;
+      --text-muted: #8E9BAE;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg-canvas);
+      color: var(--text-primary);
+      display: flex;
+      height: 100vh;
+      overflow: hidden;
+    }
+    /* Left Sidebar */
+    .sidebar {
+      width: 320px;
+      background: var(--bg-panel);
+      border-right: 1px solid var(--border-color);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+      z-index: 10;
+    }
+    .brand {
+      padding: 20px;
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .brand-icon {
+      width: 36px;
+      height: 36px;
+      background: linear-gradient(135deg, var(--accent-amber), #E08500);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      color: #000;
+      font-size: 18px;
+    }
+    .brand-title { font-weight: 700; font-size: 18px; letter-spacing: -0.5px; }
+    .brand-badge {
+      font-size: 10px;
+      background: rgba(0, 212, 200, 0.15);
+      color: var(--accent-teal);
+      border: 1px solid rgba(0, 212, 200, 0.3);
+      padding: 2px 6px;
+      border-radius: 999px;
+      font-weight: 600;
+    }
+    .screens-nav {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px;
+    }
+    .nav-label {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      margin: 12px 8px 6px;
+    }
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      margin-bottom: 2px;
+    }
+    .nav-item:hover {
+      background: var(--bg-surface);
+      color: var(--text-primary);
+    }
+    .nav-item.active {
+      background: rgba(245, 166, 35, 0.12);
+      color: var(--accent-amber);
+      font-weight: 600;
+      border-left: 3px solid var(--accent-amber);
+    }
+    .nav-num {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      opacity: 0.6;
+      width: 20px;
+    }
+    /* Main Canvas */
+    .canvas {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      position: relative;
+    }
+    .toolbar {
+      height: 56px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+    }
+    .screen-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .screen-title { font-size: 16px; font-weight: 600; }
+    .screen-replaces { font-size: 12px; color: var(--text-muted); font-style: italic; }
+    .btn-group { display: flex; gap: 8px; }
+    .btn {
+      padding: 8px 14px;
+      font-size: 12px;
+      font-weight: 600;
+      border-radius: 6px;
+      border: 1px solid var(--border-color);
+      background: var(--bg-surface);
+      color: var(--text-primary);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      text-decoration: none;
+      transition: all 0.15s ease;
+    }
+    .btn:hover { background: rgba(255, 255, 255, 0.1); }
+    .btn-primary {
+      background: var(--accent-amber);
+      color: #000;
+      border: none;
+    }
+    .btn-primary:hover { background: #E08500; }
+    
+    .viewport {
+      flex: 1;
+      overflow: auto;
+      padding: 40px;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      background: radial-gradient(circle at 50% 50%, #151A24 0%, #090B0E 100%);
+    }
+    .frame-wrapper {
+      max-width: 1400px;
+      width: 100%;
+      background: var(--bg-panel);
+      border: 1px solid var(--border-color);
+      border-radius: 14px;
+      overflow: hidden;
+      box-shadow: 0 25px 60px rgba(0, 0, 0, 0.6), 0 0 1px 1px rgba(255, 255, 255, 0.05);
+    }
+    .frame-bar {
+      height: 36px;
+      background: #151922;
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      padding: 0 16px;
+      gap: 8px;
+    }
+    .frame-dot { width: 10px; height: 10px; border-radius: 50%; }
+    .dot-red { background: #FF5F56; }
+    .dot-yellow { background: #FFBD2E; }
+    .dot-green { background: #27C93F; }
+    .frame-url {
+      flex: 1;
+      max-width: 400px;
+      margin: 0 auto;
+      text-align: center;
+      background: rgba(0, 0, 0, 0.25);
+      border-radius: 6px;
+      padding: 3px 12px;
+      font-size: 11px;
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--text-muted);
+    }
+    .frame-img {
+      width: 100%;
+      display: block;
+      height: auto;
+    }
+    /* Grid Overview Mode */
+    .grid-view {
+      display: none;
+      grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+      gap: 24px;
+      width: 100%;
+      padding: 10px;
+    }
+    .grid-card {
+      background: var(--bg-panel);
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      overflow: hidden;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+    .grid-card:hover {
+      border-color: var(--accent-amber);
+      transform: translateY(-3px);
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.4);
+    }
+    .grid-card img { width: 100%; height: auto; display: block; }
+    .grid-card-footer {
+      padding: 12px 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 13px;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-icon">⚡</div>
+      <div>
+        <div class="brand-title">ForgeQA</div>
+      </div>
+      <span class="brand-badge">11 Screens</span>
+    </div>
+
+    <nav class="screens-nav">
+      <div class="nav-label">Core Modules</div>
+      <div class="nav-item active" onclick="showScreen(1)">
+        <span class="nav-num">01</span> QA Command Center
+      </div>
+      <div class="nav-item" onclick="showScreen(2)">
+        <span class="nav-num">02</span> Bug Tracker (Kanban)
+      </div>
+      <div class="nav-item" onclick="showScreen(3)">
+        <span class="nav-num">03</span> API Testing Client
+      </div>
+      <div class="nav-item" onclick="showScreen(4)">
+        <span class="nav-num">04</span> Test Management
+      </div>
+      <div class="nav-item" onclick="showScreen(5)">
+        <span class="nav-num">05</span> Forge AI Assistant
+      </div>
+      <div class="nav-item" onclick="showScreen(6)">
+        <span class="nav-num">06</span> QA Analytics
+      </div>
+
+      <div class="nav-label">Execution & Infra</div>
+      <div class="nav-item" onclick="showScreen(7)">
+        <span class="nav-num">07</span> Automation Testing IDE
+      </div>
+      <div class="nav-item" onclick="showScreen(8)">
+        <span class="nav-num">08</span> Performance Testing
+      </div>
+      <div class="nav-item" onclick="showScreen(9)">
+        <span class="nav-num">09</span> Security OWASP Scanner
+      </div>
+      <div class="nav-item" onclick="showScreen(10)">
+        <span class="nav-num">10</span> Cross-Browser Testing
+      </div>
+      <div class="nav-item" onclick="showScreen(11)">
+        <span class="nav-num">11</span> PRD & Knowledge Base
+      </div>
+
+      <div class="nav-label" style="margin-top: 18px;">View Mode</div>
+      <div class="nav-item" onclick="toggleGridView()">
+        <span>⊞</span> View All in Grid
+      </div>
+    </nav>
+  </aside>
+
+  <!-- Canvas -->
+  <main class="canvas">
+    <div class="toolbar">
+      <div class="screen-header">
+        <h2 id="currentTitle" class="screen-title">QA Command Center (Unified Dashboard)</h2>
+        <span id="currentReplaces" class="screen-replaces">Replaces: Jira + Allure + Slack Dashboards</span>
+      </div>
+      <div class="btn-group">
+        <button class="btn" onclick="toggleGridView()" id="viewToggleBtn">⊞ Grid View</button>
+        <a id="downloadBtn" href="mockups/01_command_center.jpg" download class="btn btn-primary">⬇ Download HD Image</a>
+      </div>
+    </div>
+
+    <div class="viewport" id="viewport">
+      <!-- Single Frame View -->
+      <div class="frame-wrapper" id="singleFrame">
+        <div class="frame-bar">
+          <div class="frame-dot dot-red"></div>
+          <div class="frame-dot dot-yellow"></div>
+          <div class="frame-dot dot-green"></div>
+          <div class="frame-url" id="frameUrl">app.forgeqa.in/dashboard</div>
+        </div>
+        <img id="frameImage" class="frame-img" src="mockups/01_command_center.jpg" alt="Screen Mockup">
+      </div>
+
+      <!-- Grid Overview View -->
+      <div class="grid-view" id="gridView"></div>
+    </div>
+  </main>
+
+  <script>
+    const screens = [
+      { id: 1, title: "QA Command Center (Unified Dashboard)", replaces: "Replaces: Jira + Allure + Datadog QA", file: "mockups/01_command_center.jpg", url: "app.forgeqa.in/dashboard" },
+      { id: 2, title: "Bug Tracker & Defect Management", replaces: "Replaces: Jira Defect Board, Bugzilla, Linear", file: "mockups/02_bug_tracker.jpg", url: "app.forgeqa.in/bugs" },
+      { id: 3, title: "API Testing Client (Postman Alternative)", replaces: "Replaces: Postman, Insomnia, Swagger UI", file: "mockups/03_api_testing.jpg", url: "app.forgeqa.in/api-client" },
+      { id: 4, title: "Test Management & Run Execution", replaces: "Replaces: TestRail, qTest, Azure Test Plans", file: "mockups/04_test_management.jpg", url: "app.forgeqa.in/test-cases" },
+      { id: 5, title: "Forge Assistant (Specialized QA AI)", replaces: "Replaces: ChatGPT, Claude for QA Prompting", file: "mockups/05_ai_assistant.jpg", url: "app.forgeqa.in/assistant" },
+      { id: 6, title: "QA Intelligence & Analytics", replaces: "Replaces: Grafana, QMetry, Looker Studio", file: "mockups/06_analytics.jpg", url: "app.forgeqa.in/analytics" },
+      { id: 7, title: "Automation Testing IDE & Cloud Runner", replaces: "Replaces: Playwright CLI, Cypress Dashboard, Selenium Grid", file: "mockups/07_automation_testing.jpg", url: "app.forgeqa.in/automation" },
+      { id: 8, title: "Performance & Load Testing", replaces: "Replaces: JMeter, k6 Cloud, LoadRunner", file: "mockups/08_performance_testing.jpg", url: "app.forgeqa.in/performance" },
+      { id: 9, title: "Security Testing & OWASP Top 10 Scanner", replaces: "Replaces: OWASP ZAP, Burp Suite, Acunetix", file: "mockups/09_security_testing.jpg", url: "app.forgeqa.in/security" },
+      { id: 10, title: "Cross-Browser & Visual Regression", replaces: "Replaces: BrowserStack, Percy, Applitools", file: "mockups/10_cross_browser.jpg", url: "app.forgeqa.in/cross-browser" },
+      { id: 11, title: "PRD Documentation & Traceability Matrix", replaces: "Replaces: Confluence, Notion, Google Docs for QA", file: "mockups/11_knowledge_base.jpg", url: "app.forgeqa.in/docs" }
+    ];
+
+    let isGrid = false;
+
+    function showScreen(num) {
+      isGrid = false;
+      document.getElementById('singleFrame').style.display = 'block';
+      document.getElementById('gridView').style.display = 'none';
+      document.getElementById('viewToggleBtn').innerText = '⊞ Grid View';
+
+      const s = screens.find(item => item.id === num);
+      if (!s) return;
+
+      document.getElementById('currentTitle').innerText = s.title;
+      document.getElementById('currentReplaces').innerText = s.replaces;
+      document.getElementById('frameUrl').innerText = s.url;
+      document.getElementById('frameImage').src = s.file;
+      document.getElementById('downloadBtn').href = s.file;
+
+      document.querySelectorAll('.nav-item').forEach((item, idx) => {
+        if (idx === num - 1) item.classList.add('active');
+        else item.classList.remove('active');
+      });
+    }
+
+    function toggleGridView() {
+      isGrid = !isGrid;
+      const single = document.getElementById('singleFrame');
+      const grid = document.getElementById('gridView');
+      const btn = document.getElementById('viewToggleBtn');
+
+      if (isGrid) {
+        single.style.display = 'none';
+        grid.style.display = 'grid';
+        btn.innerText = '⌕ Single View';
+        document.getElementById('currentTitle').innerText = 'All 11 Screens Overview';
+        document.getElementById('currentReplaces').innerText = 'Complete ForgeQA Design System';
+
+        if (!grid.hasChildNodes()) {
+          screens.forEach(s => {
+            const card = document.createElement('div');
+            card.className = 'grid-card';
+            card.onclick = () => showScreen(s.id);
+            card.innerHTML = `
+              <img src="${s.file}" alt="${s.title}">
+              <div class="grid-card-footer">
+                <span>${s.id}. ${s.title}</span>
+                <span style="color: var(--accent-amber)">Inspect →</span>
+              </div>
+            `;
+            grid.appendChild(card);
+          });
+        }
+      } else {
+        showScreen(1);
+      }
+    }
+  </script>
+</body>
+</html>

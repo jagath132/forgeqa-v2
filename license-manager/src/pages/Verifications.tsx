@@ -1,0 +1,820 @@
+import { useEffect, useState, useCallback } from 'react';
+import axios from 'axios';
+import { api, type PendingRegistration, type ProductKey } from '../lib/api';
+import { useConfirm } from '../components/ConfirmDialog';
+import {
+  RefreshCw,
+  ShieldCheck,
+  Clock,
+  Calendar,
+  Layout,
+  Check,
+  X,
+  XCircle,
+  Trash2,
+  Mail,
+  KeyRound,
+  RefreshCw as RetryIcon,
+  Sparkles,
+} from 'lucide-react';
+
+const PLAN_LABELS: Record<string, string> = { free: 'Free', pro: 'Pro', enterprise: 'Enterprise' };
+const PLAN_COLORS: Record<string, string> = {
+  free: 'var(--color-text-muted)',
+  pro: 'var(--color-accent)',
+  enterprise: 'var(--color-warning)',
+};
+
+function getErrorMessage(error: unknown, fallback: string) {
+  if (axios.isAxiosError<{ error?: string }>(error)) {
+    return error.response?.data?.error || fallback;
+  }
+  return error instanceof Error ? error.message : fallback;
+}
+
+export function VerificationsPage() {
+  const [items, setItems] = useState<PendingRegistration[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [filter, setFilter] = useState<'pending_verification' | 'all'>('pending_verification');
+  const [selectedItem, setSelectedItem] = useState<PendingRegistration | null>(null);
+  const [rejectReason, setRejectReason] = useState('');
+
+  // Assign Key modal state
+  const [assignKeyItem, setAssignKeyItem] = useState<PendingRegistration | null>(null);
+  const [assignMode, setAssignMode] = useState<'auto' | 'inventory' | 'manual'>('auto');
+  const [availableKeys, setAvailableKeys] = useState<ProductKey[]>([]);
+  const [keysLoading, setKeysLoading] = useState(false);
+  const [selectedKeyValue, setSelectedKeyValue] = useState('');
+  const [manualKey, setManualKey] = useState('');
+
+  const confirm = useConfirm();
+
+  const showToast = useCallback((type: 'success' | 'error', message: string) => {
+    setToast({ type, message });
+    setTimeout(() => setToast(null), 4000);
+  }, []);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (filter !== 'all') params.set('status', filter);
+      const res = await api.get<{ registrations: PendingRegistration[] }>(
+        `/api/admin/verifications?${params}`
+      );
+      setItems(res.data.registrations);
+    } catch {
+      showToast('error', 'Failed to load registrations');
+    } finally {
+      setLoading(false);
+    }
+  }, [filter, showToast]);
+
+  useEffect(() => {
+    load();
+    const interval = setInterval(load, 30000);
+    return () => clearInterval(interval);
+  }, [load]);
+
+  async function handleApprove(item: PendingRegistration) {
+    setActionLoading(item.pendingId);
+    try {
+      await api.post('/api/admin/verifications/approve', { pendingId: item.pendingId });
+      showToast(
+        'success',
+        `${item.email} approved - assign a product key to send the welcome email.`
+      );
+      await load();
+    } catch (err: unknown) {
+      showToast('error', getErrorMessage(err, 'Failed to approve'));
+    }
+    setActionLoading(null);
+  }
+
+  async function handleReject(item: PendingRegistration, reason: string) {
+    setActionLoading(item.pendingId);
+    try {
+      const res = await api.post<{ emailStatus: string; emailError?: string }>(
+        '/api/admin/verifications/reject',
+        { pendingId: item.pendingId, reason }
+      );
+      if (res.data.emailStatus === 'failed') {
+        showToast(
+          'error',
+          `Registration rejected, but the notification email failed${res.data.emailError ? `: ${res.data.emailError}` : '.'}`
+        );
+        setFilter('all');
+      } else {
+        showToast('success', `Rejection notification sent to ${item.email}`);
+      }
+      setSelectedItem(null);
+      setRejectReason('');
+      if (res.data.emailStatus !== 'failed') await load();
+    } catch (err: unknown) {
+      showToast('error', getErrorMessage(err, 'Failed to reject'));
+    }
+    setActionLoading(null);
+  }
+
+  async function openAssignKeyModal(item: PendingRegistration) {
+    setAssignKeyItem(item);
+    setAssignMode('auto');
+    setSelectedKeyValue('');
+    setManualKey('');
+    setKeysLoading(true);
+    try {
+      const res = await api.get<{ keys: ProductKey[] }>('/api/admin/keys?status=available');
+      setAvailableKeys(res.data.keys);
+    } catch {
+      showToast('error', 'Failed to load available keys');
+      setAvailableKeys([]);
+    } finally {
+      setKeysLoading(false);
+    }
+  }
+
+  async function handleAssignKey() {
+    if (!assignKeyItem) return;
+    const payload: { autoGenerate?: boolean; productKey?: string } = {};
+
+    if (assignMode === 'auto') {
+      payload.autoGenerate = true;
+    } else if (assignMode === 'inventory') {
+      if (!selectedKeyValue) {
+        showToast('error', 'Please select a product key from the inventory.');
+        return;
+      }
+      payload.productKey = selectedKeyValue;
+    } else if (assignMode === 'manual') {
+      const key = manualKey.trim().toUpperCase();
+      if (!key) {
+        showToast('error', 'Please enter a valid product key.');
+        return;
+      }
+      payload.productKey = key;
+    }
+
+    setActionLoading(assignKeyItem.pendingId);
+    try {
+      const res = await api.post<{ emailStatus: string; emailError?: string; productKey: string }>(
+        `/api/admin/verifications/${encodeURIComponent(assignKeyItem.pendingId)}/assign-key`,
+        payload
+      );
+      if (res.data.emailStatus === 'failed') {
+        showToast(
+          'error',
+          `Key assigned, but the welcome email failed${res.data.emailError ? `: ${res.data.emailError}` : '. Use "Retry email" to resend.'}`
+        );
+        setFilter('all');
+      } else {
+        showToast(
+          'success',
+          `Key ${res.data.productKey} assigned and welcome email sent to ${assignKeyItem.email}`
+        );
+      }
+      setAssignKeyItem(null);
+      await load();
+    } catch (err: unknown) {
+      showToast('error', getErrorMessage(err, 'Failed to assign key'));
+    }
+    setActionLoading(null);
+  }
+
+  async function handleRetryEmail(item: PendingRegistration) {
+    setActionLoading(item.pendingId);
+    try {
+      const res = await api.post<{ emailStatus: string; emailError?: string }>(
+        `/api/admin/verifications/${encodeURIComponent(item.pendingId)}/resend-email`
+      );
+      if (res.data.emailStatus === 'failed') {
+        showToast('error', res.data.emailError || 'Email delivery failed again.');
+      } else {
+        showToast('success', `Email sent to ${item.email}`);
+      }
+      await load();
+    } catch (err: unknown) {
+      showToast('error', getErrorMessage(err, 'Failed to resend email'));
+    }
+    setActionLoading(null);
+  }
+
+  async function handleDelete(item: PendingRegistration) {
+    if (
+      !(await confirm({
+        title: 'Delete registration',
+        message: `Delete registration record for ${item.email}? This removes it from the queue permanently.`,
+        confirmLabel: 'Delete',
+      }))
+    )
+      return;
+    setActionLoading(item.pendingId);
+    try {
+      await api.delete(`/api/admin/verifications/${encodeURIComponent(item.pendingId)}`);
+      showToast('success', `Deleted registration for ${item.email}`);
+      await load();
+    } catch (err: unknown) {
+      showToast('error', getErrorMessage(err, 'Failed to delete'));
+    }
+    setActionLoading(null);
+  }
+
+  const pendingCount = items.filter((i) => i.status === 'pending_verification').length;
+
+  return (
+    <div>
+      <div className="section-header">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <h3>Pending Verifications</h3>
+          {pendingCount > 0 && (
+            <span
+              style={{
+                background: 'var(--color-warning-subtle)',
+                color: 'var(--color-warning)',
+                borderRadius: 20,
+                padding: '2px 10px',
+                fontSize: 12,
+                fontWeight: 600,
+                border: '1px solid rgba(217,119,6,0.2)',
+              }}
+            >
+              {pendingCount} pending
+            </span>
+          )}
+        </div>
+        <button className="btn btn-secondary" onClick={load}>
+          <RefreshCw size={14} strokeWidth={2} />
+          Refresh
+        </button>
+      </div>
+
+      <div className="card" style={{ marginBottom: 20 }}>
+        <div className="pill-group">
+          <button
+            className={`pill${filter === 'pending_verification' ? ' active' : ''}`}
+            onClick={() => setFilter('pending_verification')}
+          >
+            Awaiting Review
+          </button>
+          <button
+            className={`pill${filter === 'all' ? ' active' : ''}`}
+            onClick={() => setFilter('all')}
+          >
+            All Registrations
+          </button>
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="empty-state">
+          <div
+            style={{
+              width: 24,
+              height: 24,
+              border: '2px solid var(--color-accent)',
+              borderTopColor: 'transparent',
+              borderRadius: '50%',
+              animation: 'lm-spin 0.8s linear infinite',
+              margin: '0 auto 12px',
+            }}
+          />
+          <p>Loading registrations...</p>
+        </div>
+      ) : items.length === 0 ? (
+        <div className="empty-state">
+          <ShieldCheck size={40} strokeWidth={1.5} className="empty-state-icon" />
+          <h3>{filter === 'pending_verification' ? 'All Clear!' : 'No Registrations'}</h3>
+          <p>
+            {filter === 'pending_verification'
+              ? 'No pending verifications at this time.'
+              : 'No registration records found.'}
+          </p>
+        </div>
+      ) : (
+        <div className="verification-queue">
+          {items.map((item) => (
+            <div key={item.pendingId} className="verification-card">
+              <div
+                className="verification-avatar"
+                style={{
+                  background: item.plan ? PLAN_COLORS[item.plan] + '18' : 'var(--color-elevated)',
+                  color: item.plan ? PLAN_COLORS[item.plan] : 'var(--color-text-muted)',
+                }}
+              >
+                {(item.name || item.email).charAt(0).toUpperCase()}
+              </div>
+              <div className="verification-info">
+                <div className="name">{item.name || '-'}</div>
+                <div className="email">{item.email}</div>
+                <div className="verification-meta">
+                  <div className="verification-meta-item">
+                    <Clock size={14} strokeWidth={2} />
+                    <span
+                      style={{
+                        color: item.plan ? PLAN_COLORS[item.plan] : 'var(--color-text-muted)',
+                        fontWeight: 600,
+                        textTransform: 'uppercase',
+                        fontSize: 11,
+                        letterSpacing: '0.05em',
+                      }}
+                    >
+                      {item.plan ? PLAN_LABELS[item.plan] : '-'}
+                    </span>
+                  </div>
+                  <div className="verification-meta-item">
+                    <Calendar size={14} strokeWidth={2} />
+                    {new Date(item.createdAt).toLocaleString(undefined, {
+                      dateStyle: 'medium',
+                      timeStyle: 'short',
+                    })}
+                  </div>
+                  <div className="verification-meta-item">
+                    <Layout size={14} strokeWidth={2} />
+                    <span
+                      className={`badge badge-${item.paymentStatus === 'completed' ? 'used' : 'available'}`}
+                      style={{ fontSize: 10 }}
+                    >
+                      {item.paymentStatus}
+                    </span>
+                  </div>
+                  <div className="verification-meta-item">
+                    <span
+                      className={`badge ${item.status === 'pending_verification'
+                        ? 'badge-warning'
+                        : item.status === 'ready'
+                          ? 'badge-used'
+                          : 'badge-available'
+                        }`}
+                      style={{ fontSize: 10 }}
+                    >
+                      {item.status === 'pending_verification'
+                        ? 'Awaiting'
+                        : item.status === 'ready'
+                          ? 'Approved'
+                          : item.status}
+                    </span>
+                  </div>
+                  {/* Product key badge for approved registrations */}
+                  {item.status === 'ready' && (
+                    <div className="verification-meta-item">
+                      <KeyRound size={14} strokeWidth={2} />
+                      <span
+                        className={`badge ${item.productKey ? 'badge-used' : 'badge-warning'}`}
+                        style={{ fontSize: 10 }}
+                      >
+                        {item.productKey ? 'Key assigned' : 'Key pending'}
+                      </span>
+                    </div>
+                  )}
+                  {item.notificationEmailStatus && (
+                    <div
+                      className="verification-meta-item"
+                      title={item.notificationEmailError || undefined}
+                    >
+                      <Mail size={14} strokeWidth={2} />
+                      <span
+                        className={`badge ${item.notificationEmailStatus === 'sent'
+                          ? 'badge-used'
+                          : item.notificationEmailStatus === 'failed'
+                            ? 'badge-expired'
+                            : 'badge-warning'
+                          }`}
+                        style={{ fontSize: 10 }}
+                      >
+                        Email {item.notificationEmailStatus}
+                      </span>
+                      {item.notificationEmailSentAt && (
+                        <span style={{ fontSize: 10, color: 'var(--color-text-muted)' }}>
+                          {new Date(item.notificationEmailSentAt).toLocaleString(undefined, {
+                            dateStyle: 'short',
+                            timeStyle: 'short',
+                          })}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+                {item.notificationEmailStatus === 'failed' && item.notificationEmailError && (
+                  <div
+                    role="alert"
+                    style={{
+                      marginTop: 8,
+                      color: 'var(--color-danger)',
+                      fontSize: 12,
+                      overflowWrap: 'anywhere',
+                    }}
+                  >
+                    Email delivery failed: {item.notificationEmailError}
+                  </div>
+                )}
+              </div>
+              {item.status === 'pending_verification' ? (
+                <div className="verification-actions">
+                  <button
+                    className="btn btn-primary btn-sm"
+                    disabled={actionLoading === item.pendingId}
+                    onClick={() => handleApprove(item)}
+                    title="Approve this registration (you will assign a product key in the next step)"
+                  >
+                    {actionLoading === item.pendingId ? (
+                      <div
+                        style={{
+                          width: 12,
+                          height: 12,
+                          border: '2px solid rgba(255,255,255,0.4)',
+                          borderTopColor: '#fff',
+                          borderRadius: '50%',
+                          animation: 'lm-spin 0.8s linear infinite',
+                        }}
+                      />
+                    ) : (
+                      <Check size={13} strokeWidth={2.5} />
+                    )}
+                    Approve
+                  </button>
+                  <button
+                    className="btn btn-danger btn-sm"
+                    disabled={actionLoading === item.pendingId}
+                    onClick={() => {
+                      setSelectedItem(item);
+                      setRejectReason('');
+                    }}
+                    title="Reject this registration"
+                  >
+                    <X size={13} strokeWidth={2.5} />
+                    Reject
+                  </button>
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    disabled={actionLoading === item.pendingId}
+                    onClick={() => handleDelete(item)}
+                    title="Delete this registration record"
+                  >
+                    <Trash2 size={13} strokeWidth={2.5} />
+                  </button>
+                </div>
+              ) : (
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    flexShrink: 0,
+                    marginTop: 4,
+                    flexWrap: 'wrap',
+                    justifyContent: 'flex-end',
+                  }}
+                >
+                  {/* Assign Key button - shown for approved registrations without a welcome email yet */}
+                  {item.status === 'ready' && item.notificationEmailStatus !== 'sent' && (
+                    <button
+                      className="btn btn-primary btn-sm"
+                      disabled={actionLoading === item.pendingId}
+                      onClick={() => openAssignKeyModal(item)}
+                      title="Assign a product key and send the welcome email"
+                    >
+                      <KeyRound size={13} strokeWidth={2} />
+                      Assign Key
+                    </button>
+                  )}
+                  {/* Retry email - for approved registrations where key is assigned but email failed */}
+                  {item.notificationEmailStatus === 'failed' && item.productKey && (
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      disabled={actionLoading === item.pendingId}
+                      onClick={() => handleRetryEmail(item)}
+                      title={item.notificationEmailError || 'Retry notification email'}
+                    >
+                      {actionLoading === item.pendingId ? (
+                        <RetryIcon size={13} className="lm-spin" strokeWidth={2} />
+                      ) : (
+                        <RetryIcon size={13} strokeWidth={2} />
+                      )}
+                      Retry email
+                    </button>
+                  )}
+                  <span
+                    style={{ fontSize: 12, color: 'var(--color-text-muted)', fontStyle: 'italic' }}
+                  >
+                    {item.status === 'ready' ? 'Approved' : item.status}
+                  </span>
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    disabled={actionLoading === item.pendingId}
+                    onClick={() => handleDelete(item)}
+                    title="Delete this registration record"
+                  >
+                    <Trash2 size={13} strokeWidth={2.5} />
+                  </button>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Reject modal */}
+      {selectedItem && (
+        <div className="modal-overlay" onClick={() => setSelectedItem(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 460 }}>
+            <div className="modal-header">
+              <h3>Reject Registration</h3>
+              <button className="modal-close" onClick={() => setSelectedItem(null)}>
+                <X size={18} strokeWidth={2} />
+              </button>
+            </div>
+            <div className="modal-body">
+              <div
+                style={{
+                  marginBottom: 16,
+                  padding: '12px 16px',
+                  background: 'var(--color-bg)',
+                  borderRadius: 'var(--radius)',
+                  border: '1px solid var(--color-border)',
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: 13,
+                    fontWeight: 600,
+                    marginBottom: 2,
+                    color: 'var(--color-text-primary)',
+                  }}
+                >
+                  {selectedItem.name}
+                </div>
+                <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
+                  {selectedItem.email}
+                </div>
+                {selectedItem.plan && (
+                  <div
+                    style={{
+                      fontSize: 11,
+                      color: PLAN_COLORS[selectedItem.plan],
+                      fontWeight: 600,
+                      marginTop: 4,
+                      textTransform: 'uppercase',
+                    }}
+                  >
+                    {PLAN_LABELS[selectedItem.plan]} Plan
+                  </div>
+                )}
+              </div>
+              <div className="form-group">
+                <label>Reason for Rejection (optional)</label>
+                <textarea
+                  className="form-input"
+                  placeholder="e.g. Unable to verify identity, suspicious activity..."
+                  value={rejectReason}
+                  onChange={(e) => setRejectReason(e.target.value)}
+                  rows={3}
+                />
+                <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 4 }}>
+                  This reason will be included in the rejection email.
+                </div>
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button className="btn btn-secondary" onClick={() => setSelectedItem(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-danger"
+                disabled={actionLoading === selectedItem.pendingId}
+                onClick={() => handleReject(selectedItem, rejectReason)}
+              >
+                {actionLoading === selectedItem.pendingId ? 'Rejecting...' : 'Confirm Reject'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Assign Key modal */}
+      {/* Assign Key Modal */}
+      {assignKeyItem && (
+        <div className="modal-overlay" onClick={() => setAssignKeyItem(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 520 }}>
+            <div className="modal-header">
+              <h3>Assign Product Key</h3>
+              <button className="modal-close" onClick={() => setAssignKeyItem(null)}>
+                <X size={18} strokeWidth={2} />
+              </button>
+            </div>
+
+            {/* Mode selection tabs */}
+            <div className="modal-tabs">
+              <button
+                type="button"
+                className={`modal-tab${assignMode === 'auto' ? ' active' : ''}`}
+                onClick={() => setAssignMode('auto')}
+              >
+                ⚡ Auto-Generate
+              </button>
+              <button
+                type="button"
+                className={`modal-tab${assignMode === 'inventory' ? ' active' : ''}`}
+                onClick={() => setAssignMode('inventory')}
+              >
+                From Stock ({availableKeys.length})
+              </button>
+              <button
+                type="button"
+                className={`modal-tab${assignMode === 'manual' ? ' active' : ''}`}
+                onClick={() => setAssignMode('manual')}
+              >
+                Manual Key
+              </button>
+            </div>
+
+            <div className="modal-body">
+              {/* Registration summary */}
+              <div
+                style={{
+                  marginBottom: 16,
+                  padding: '12px 16px',
+                  background: 'var(--color-bg)',
+                  borderRadius: 'var(--radius)',
+                  border: '1px solid var(--color-border)',
+                }}
+              >
+                <div
+                  style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)', marginBottom: 2 }}
+                >
+                  {assignKeyItem.name || assignKeyItem.email}
+                </div>
+                <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
+                  {assignKeyItem.email}
+                </div>
+                {assignKeyItem.plan && (
+                  <div
+                    style={{
+                      fontSize: 11,
+                      color: PLAN_COLORS[assignKeyItem.plan],
+                      fontWeight: 600,
+                      marginTop: 4,
+                      textTransform: 'uppercase',
+                    }}
+                  >
+                    {PLAN_LABELS[assignKeyItem.plan]} Plan
+                  </div>
+                )}
+              </div>
+
+              {/* Mode 1: Auto-generate */}
+              {assignMode === 'auto' && (
+                <div
+                  style={{
+                    padding: '16px',
+                    borderRadius: 'var(--radius)',
+                    background: 'var(--color-surface)',
+                    border: '1px solid var(--color-accent)',
+                    marginBottom: 16,
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                    <Sparkles size={16} style={{ color: 'var(--color-accent)' }} />
+                    <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)' }}>
+                      Instant Key Minting (1-Click)
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.5 }}>
+                    A fresh, unique product key tailored for the{' '}
+                    <strong style={{ color: 'var(--color-text-primary)' }}>
+                      {PLAN_LABELS[assignKeyItem.plan] || 'Free'} Plan
+                    </strong>{' '}
+                    will be generated automatically on the fly and assigned to{' '}
+                    <strong style={{ color: 'var(--color-text-primary)' }}>{assignKeyItem.email}</strong>.
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 8 }}>
+                    ⚡ No need to pre-generate keys or maintain stock beforehand.
+                  </div>
+                </div>
+              )}
+
+              {/* Mode 2: From Inventory */}
+              {assignMode === 'inventory' && (
+                <div className="form-group" style={{ marginBottom: 16 }}>
+                  <label>Select from available stock ({availableKeys.length} available)</label>
+                  {keysLoading ? (
+                    <div style={{ fontSize: 13, color: 'var(--color-text-muted)', padding: '8px 0' }}>
+                      Loading keys...
+                    </div>
+                  ) : availableKeys.length === 0 ? (
+                    <div
+                      style={{
+                        fontSize: 12,
+                        color: 'var(--color-warning)',
+                        padding: '12px',
+                        background: 'rgba(217,119,6,0.08)',
+                        borderRadius: 'var(--radius)',
+                        border: '1px solid rgba(217,119,6,0.2)',
+                      }}
+                    >
+                      No pre-generated keys in stock. Switch to the <strong>⚡ Auto-Generate</strong> tab to mint a fresh key instantly.
+                    </div>
+                  ) : (
+                    <select
+                      className="form-input"
+                      value={selectedKeyValue}
+                      onChange={(e) => setSelectedKeyValue(e.target.value)}
+                    >
+                      <option value="">-- Select a product key --</option>
+                      {availableKeys.map((k) => (
+                        <option key={k.id} value={k.key}>
+                          {k.key}
+                          {k.customerEmail ? ` (pre-assigned: ${k.customerEmail})` : ''}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+              )}
+
+              {/* Mode 3: Manual Entry */}
+              {assignMode === 'manual' && (
+                <div className="form-group" style={{ marginBottom: 16 }}>
+                  <label>Enter Key Manually</label>
+                  <input
+                    className="form-input text-mono"
+                    placeholder="XXXXX-XXXXX-XXXXX-XXXXX-XXXXX"
+                    value={manualKey}
+                    onChange={(e) => setManualKey(e.target.value.toUpperCase())}
+                    style={{ letterSpacing: 2 }}
+                  />
+                  <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 4 }}>
+                    The key must exist in the system and be available.
+                  </div>
+                </div>
+              )}
+
+              {/* Notice */}
+              <div
+                style={{
+                  padding: '10px 14px',
+                  background: 'var(--color-accent-subtle)',
+                  borderRadius: 'var(--radius)',
+                  border: '1px solid var(--color-accent)',
+                  fontSize: 12,
+                  color: 'var(--color-accent)',
+                  display: 'flex',
+                  gap: 8,
+                  alignItems: 'flex-start',
+                }}
+              >
+                <Mail size={14} strokeWidth={2} style={{ flexShrink: 0, marginTop: 1 }} />
+                <span>
+                  Confirming will immediately send exactly one <strong>Welcome to ForgeQA</strong> email
+                  to <strong>{assignKeyItem.email}</strong> with activation instructions.
+                </span>
+              </div>
+            </div>
+
+            <div className="modal-actions">
+              <button className="btn btn-secondary" onClick={() => setAssignKeyItem(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary"
+                disabled={
+                  actionLoading === assignKeyItem.pendingId ||
+                  (assignMode === 'inventory' && !selectedKeyValue) ||
+                  (assignMode === 'manual' && !manualKey.trim())
+                }
+                onClick={handleAssignKey}
+              >
+                {actionLoading === assignKeyItem.pendingId ? (
+                  'Assigning & Sending...'
+                ) : assignMode === 'auto' ? (
+                  <>
+                    <Sparkles size={14} strokeWidth={2} />
+                    Generate Key &amp; Send Welcome Email
+                  </>
+                ) : (
+                  <>
+                    <Mail size={14} strokeWidth={2} />
+                    Assign Key &amp; Send Welcome Email
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {toast && (
+        <div className="toast-container">
+          <div className={`toast toast-${toast.type}`}>
+            {toast.type === 'success' ? (
+              <Check size={18} strokeWidth={2} />
+            ) : (
+              <XCircle size={18} strokeWidth={2} />
+            )}
+            {toast.message}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

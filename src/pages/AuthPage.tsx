@@ -1,0 +1,670 @@
+import { useState, useEffect, FormEvent, useRef, useCallback } from 'react';
+import axios from 'axios';
+import { useNavigate } from 'react-router-dom';
+import { api, type AuthResponse } from '../lib/api';
+import { useAppStore } from '../store/useAppStore';
+import { ForgeQALogo, AnvilFLogoMark } from '../components/ui/ForgeQALogo';
+
+type AuthMode = 'login' | 'forgot';
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PASSWORD_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/;
+
+const CONSOLE_LINES = [
+  '✓ login flow ........................ passed',
+  '✓ token validation ................. 0.3s',
+  '✓ test suite (12/12) ............... passed',
+  '✓ api contract ..................... verified',
+  '✓ db connection .................... 4ms',
+  '✓ cache invalidation ............... ok',
+  '✓ auth middleware .................. passed',
+  '✓ rate limiter ..................... 2ms',
+  '✓ input sanitization ............... clean',
+  '✓ response format .................. valid',
+  '✓ ssl handshake .................... 12ms',
+  '✓ csrf check ....................... passed',
+  '✓ cors policy ...................... valid',
+  '✓ session store .................... ok',
+  '✓ request validation ............... passed',
+  '✓ permission check ................. ok',
+  '✓ audit log ........................ written',
+  '✓ running suite (12/12) ............ ',
+];
+
+function ConsoleFeed() {
+  const [displayed, setDisplayed] = useState<string[]>([]);
+  const [index, setIndex] = useState(0);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDisplayed((prev) => {
+        const next = [...prev, CONSOLE_LINES[index]];
+        return next.length > 8 ? next.slice(-8) : next;
+      });
+      setIndex((i) => (i + 1) % CONSOLE_LINES.length);
+    }, 320);
+    return () => clearTimeout(timer);
+  }, [index]);
+
+  return (
+    <div className="relative" style={{ height: '14rem' }}>
+      {displayed.map((line, i) => (
+        <div
+          key={`${i}-${line}`}
+          className="animate-console-line text-sm leading-[1.75rem]"
+          style={{
+            fontFamily: 'var(--font-mono)',
+            color: 'var(--signal-green)',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {line}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export function AuthPage() {
+  const navigate = useNavigate();
+  const loginUser = useAppStore((s) => s.loginUser);
+
+  useEffect(() => {
+    document.title = 'Sign In — ForgeQA';
+  }, []);
+
+  const [mode, setMode] = useState<AuthMode>('login');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [error, setError] = useState('');
+  const [successMessage, setSuccessMessage] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+
+  const [btnSuccess, setBtnSuccess] = useState(false);
+  const [lockoutMinutes, setLockoutMinutes] = useState(0);
+  const [lockoutCountdown, setLockoutCountdown] = useState(0);
+  const lockoutTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const submittingRef = useRef(false);
+
+  const clearLockoutTimer = useCallback(() => {
+    if (lockoutTimerRef.current) {
+      clearInterval(lockoutTimerRef.current);
+      lockoutTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return clearLockoutTimer;
+  }, [clearLockoutTimer]);
+
+  useEffect(() => {
+    if (lockoutCountdown <= 0) {
+      clearLockoutTimer();
+      return;
+    }
+    lockoutTimerRef.current = setInterval(() => {
+      setLockoutCountdown((prev) => {
+        if (prev <= 1) {
+          if (lockoutTimerRef.current) {
+            clearInterval(lockoutTimerRef.current);
+            lockoutTimerRef.current = null;
+          }
+          setTimeout(() => {
+            setLockoutMinutes(0);
+          }, 0);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return clearLockoutTimer;
+  }, [lockoutCountdown > 0, clearLockoutTimer]);
+
+  const isLocked = lockoutMinutes > 0 || lockoutCountdown > 0;
+  const isValidEmail = EMAIL_REGEX.test(email);
+  const isValidPassword = PASSWORD_REGEX.test(password);
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (!isValidEmail || submittingRef.current) return;
+    submittingRef.current = true;
+    setError('');
+    setSuccessMessage('');
+    setIsLoading(true);
+    try {
+      if (mode === 'login') {
+        const payload: Record<string, any> = { email, password };
+        const storedDeviceToken = localStorage.getItem('forgeqa_device_token');
+        if (storedDeviceToken) payload.deviceToken = storedDeviceToken;
+        const res = await api.post<AuthResponse & { deviceToken?: string }>(
+          '/api/auth/login',
+          payload
+        );
+        if (res.data.deviceToken) {
+          localStorage.setItem('forgeqa_device_token', res.data.deviceToken);
+        }
+        setBtnSuccess(true);
+        // Navigate immediately — secondary data loads in the background
+        requestAnimationFrame(() => {
+          const isNewUser = !res.data.user.has_seen_welcome;
+          loginUser(res.data.user);
+          navigate(isNewUser ? '/dashboard?welcome=true' : '/dashboard');
+        });
+      } else {
+        const res = await api.post<{ message: string }>('/api/auth/forgot-password', { email });
+        setSuccessMessage(res.data.message);
+      }
+    } catch (err) {
+      if (axios.isAxiosError(err)) {
+        const data = err.response?.data as any;
+        if (data?.lockout && data?.remainingMinutes) {
+          setLockoutMinutes(data.remainingMinutes);
+          setLockoutCountdown(data.remainingMinutes * 60);
+        }
+        setError(data?.error || err.message || 'An error occurred.');
+      } else {
+        setError('An unexpected error occurred.');
+      }
+    } finally {
+      setIsLoading(false);
+      submittingRef.current = false;
+    }
+  }
+
+  const switchMode = (m: AuthMode) => {
+    setMode(m);
+    setError('');
+    setSuccessMessage('');
+    clearLockoutTimer();
+    setLockoutMinutes(0);
+    setLockoutCountdown(0);
+  };
+
+  function formatCountdown(seconds: number): string {
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  }
+
+  return (
+    <div className="flex min-h-screen" style={{ background: 'var(--paper)' }}>
+      {/* Left panel — branding + console feed */}
+      <div
+        className="hidden md:flex md:w-[55%] flex-col relative overflow-hidden"
+        style={{ background: 'var(--ink)' }}
+      >
+        {/* Decorative gradient orbs */}
+        <div
+          className="absolute top-0 right-0 w-96 h-96 opacity-20"
+          style={{ background: 'radial-gradient(circle, rgba(49,88,255,0.3), transparent 70%)' }}
+        />
+        <div
+          className="absolute bottom-0 left-0 w-80 h-80 opacity-15"
+          style={{ background: 'radial-gradient(circle, rgba(61,217,255,0.25), transparent 70%)' }}
+        />
+
+        {/* Logo */}
+        <div className="flex items-center gap-2.5 px-10 pt-10 relative z-10">
+          <AnvilFLogoMark size={32} />
+          <span
+            className="text-base font-bold tracking-tight"
+            style={{ color: 'var(--paper)', fontFamily: 'var(--font-display)' }}
+          >
+            Forge<span style={{ color: '#06B6D4' }}>QA</span>
+          </span>
+        </div>
+
+        {/* Headline */}
+        <div className="flex-1 flex flex-col justify-center px-10 relative z-10">
+          <h1
+            className="text-5xl font-extrabold tracking-tight leading-[1.1] mb-3"
+            style={{ fontFamily: 'var(--font-display)', color: 'var(--paper)' }}
+          >
+            Ship with
+            <br />
+            <span
+              style={{
+                background: 'linear-gradient(135deg, #3158FF, #3DD9FF, #7C3AED)',
+                WebkitBackgroundClip: 'text',
+                WebkitTextFillColor: 'transparent',
+              }}
+            >
+              confidence
+            </span>
+          </h1>
+          <p
+            className="text-base max-w-sm"
+            style={{ color: 'rgba(247,249,252,0.5)', fontFamily: 'var(--font-sans)' }}
+          >
+            QA automation that catches regressions before they ship.
+          </p>
+
+          {/* Console feed */}
+          <div className="mt-12" style={{ fontFamily: 'var(--font-mono)' }}>
+            <div className="flex items-center gap-2 mb-2">
+              <span
+                className="inline-block w-2 h-2 rounded-full"
+                style={{ background: 'var(--signal-green)' }}
+              />
+              <span
+                className="text-xs font-semibold uppercase tracking-widest"
+                style={{ color: 'rgba(18,183,106,0.5)' }}
+              >
+                Test Runner
+              </span>
+            </div>
+            <div
+              className="rounded-xl p-5"
+              style={{ background: 'rgba(0,0,0,0.35)', border: '1px solid rgba(255,255,255,0.06)' }}
+            >
+              <ConsoleFeed />
+            </div>
+          </div>
+        </div>
+
+        {/* Bottom subtle branding */}
+        <div className="px-10 pb-8 relative z-10">
+          <p
+            className="text-xs"
+            style={{ color: 'rgba(247,249,252,0.2)', fontFamily: 'var(--font-mono)' }}
+          >
+            $ nex test --quiet --reporter=spec
+          </p>
+        </div>
+      </div>
+
+      {/* Right panel — auth form */}
+      <div
+        className="w-full md:w-[45%] flex items-center justify-center px-6 py-10 md:py-0"
+        style={{ background: 'var(--paper)' }}
+      >
+        <div className="w-full max-w-sm">
+          {/* Mobile logo */}
+          <div className="flex md:hidden items-center gap-2.5 mb-8">
+            <ForgeQALogo size="md" />
+          </div>
+
+          {/* Toggle */}
+          <div
+            className="flex p-1 mb-8 rounded-xl"
+            style={{ background: 'var(--mist)', border: '1px solid var(--mist)' }}
+          >
+            {(['login', 'register'] as const).map((t) => (
+              <button
+                key={t}
+                type="button"
+                onClick={() => (t === 'register' ? navigate('/register') : switchMode('login'))}
+                className="flex-1 py-2.5 text-sm font-semibold rounded-lg transition-all duration-200 cursor-pointer"
+                style={{
+                  background: mode === 'login' && t === 'login' ? 'var(--ink)' : 'transparent',
+                  color: mode === 'login' && t === 'login' ? 'var(--paper)' : 'var(--graphite)',
+                  border: 'none',
+                }}
+              >
+                {t === 'login' ? 'Sign In' : 'Create Account'}
+              </button>
+            ))}
+          </div>
+
+          {/* Error */}
+          {error && (
+            <div
+              role="alert"
+              className="mb-5 flex items-start gap-2.5 rounded-xl px-4 py-3 text-sm"
+              style={{
+                background: isLocked ? 'rgba(240,68,56,0.08)' : 'rgba(240,68,56,0.06)',
+                color: 'var(--danger)',
+                border: isLocked
+                  ? '1px solid rgba(240,68,56,0.2)'
+                  : '1px solid rgba(240,68,56,0.12)',
+              }}
+            >
+              <svg
+                className="h-5 w-5 shrink-0 mt-0.5"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                strokeWidth={2}
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+                />
+              </svg>
+              <div>
+                <span>{error}</span>
+                {isLocked && lockoutCountdown > 0 && (
+                  <span className="block mt-1 text-xs font-semibold">
+                    Try again in {formatCountdown(lockoutCountdown)}
+                  </span>
+                )}
+                {mode === 'forgot' && error.toLowerCase().includes('no account') && (
+                  <button
+                    type="button"
+                    onClick={() => navigate('/register')}
+                    className="mt-2.5 flex items-center gap-1 text-xs font-bold underline cursor-pointer hover:opacity-80 transition-opacity"
+                    style={{ color: 'var(--accent, #2563eb)' }}
+                  >
+                    Click here to create a new account &rarr;
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Forgot success state */}
+          {mode === 'forgot' && successMessage ? (
+            <div className="space-y-4">
+              <div className="flex flex-col items-center py-6 text-center">
+                <div
+                  className="w-14 h-14 rounded-2xl flex items-center justify-center mb-4"
+                  style={{ background: 'rgba(18,183,106,0.08)' }}
+                >
+                  <svg
+                    className="h-7 w-7"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="var(--signal-green)"
+                    strokeWidth={1.5}
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"
+                    />
+                  </svg>
+                </div>
+                <p className="text-base font-semibold mb-1" style={{ color: 'var(--ink)' }}>
+                  Check your email
+                </p>
+                <p className="text-sm max-w-xs" style={{ color: 'var(--graphite)' }}>
+                  {successMessage}
+                </p>
+              </div>
+              <button
+                onClick={() => switchMode('login')}
+                className="w-full py-2.5 text-sm font-semibold cursor-pointer rounded-xl transition-all"
+                style={{
+                  background: 'transparent',
+                  color: 'var(--graphite)',
+                  border: '1.5px solid var(--mist)',
+                }}
+              >
+                Back to Sign In
+              </button>
+            </div>
+          ) : (
+            <form onSubmit={handleSubmit} className="space-y-5" autoComplete="off">
+              {/* Email */}
+              <div>
+                <label
+                  htmlFor="auth_email"
+                  className="block text-xs font-semibold mb-2"
+                  style={{ color: 'var(--graphite)' }}
+                >
+                  Email
+                </label>
+                <div className="relative">
+                  <input
+                    id="auth_email"
+                    name="auth_email"
+                    type="email"
+                    required
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="you@company.com"
+                    autoComplete="off"
+                    className="w-full text-sm outline-none transition-all px-4 py-3"
+                    style={{
+                      color: 'var(--ink)',
+                      background: 'var(--bg-secondary)',
+                      border:
+                        email && !isValidEmail
+                          ? '1.5px solid var(--danger)'
+                          : '1.5px solid var(--mist)',
+                      borderRadius: 'var(--radius-lg)',
+                      fontFamily: 'var(--font-sans)',
+                    }}
+                    onFocus={(e) => {
+                      e.target.style.borderColor =
+                        email && !isValidEmail ? 'var(--danger)' : 'var(--accent)';
+                      e.target.style.boxShadow =
+                        email && !isValidEmail
+                          ? '0 0 0 3px rgba(240,68,56,0.08)'
+                          : '0 0 0 3px rgba(49,88,255,0.08)';
+                    }}
+                    onBlur={(e) => {
+                      e.target.style.borderColor =
+                        email && !isValidEmail ? 'var(--danger)' : 'var(--mist)';
+                      e.target.style.boxShadow = 'none';
+                    }}
+                  />
+                  {email && !isValidEmail && (
+                    <span
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-xs"
+                      style={{ color: 'var(--danger)' }}
+                    >
+                      Invalid format
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {/* Password */}
+              {mode === 'login' && (
+                <div>
+                  <label
+                    htmlFor="auth_password"
+                    className="block text-xs font-semibold mb-2"
+                    style={{ color: 'var(--graphite)' }}
+                  >
+                    Password
+                  </label>
+                  <div className="relative">
+                    <input
+                      id="auth_password"
+                      name="auth_password"
+                      type={showPassword ? 'text' : 'password'}
+                      required
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      placeholder="Enter your password"
+                      autoComplete="new-password"
+                      className="w-full text-sm outline-none transition-all px-4 py-3 pr-10"
+                      style={{
+                        color: 'var(--ink)',
+                        background: 'var(--bg-secondary)',
+                        border:
+                          password && !isValidPassword
+                            ? '1.5px solid var(--danger)'
+                            : '1.5px solid var(--mist)',
+                        borderRadius: 'var(--radius-lg)',
+                        fontFamily: 'var(--font-sans)',
+                      }}
+                      onFocus={(e) => {
+                        e.target.style.borderColor =
+                          password && !isValidPassword ? 'var(--danger)' : 'var(--accent)';
+                        e.target.style.boxShadow =
+                          password && !isValidPassword
+                            ? '0 0 0 3px rgba(240,68,56,0.08)'
+                            : '0 0 0 3px rgba(49,88,255,0.08)';
+                      }}
+                      onBlur={(e) => {
+                        e.target.style.borderColor =
+                          password && !isValidPassword ? 'var(--danger)' : 'var(--mist)';
+                        e.target.style.boxShadow = 'none';
+                      }}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword(!showPassword)}
+                      aria-label={showPassword ? 'Hide password' : 'Show password'}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 cursor-pointer"
+                      style={{
+                        color: 'var(--graphite)',
+                        background: 'none',
+                        border: 'none',
+                        padding: 4,
+                      }}
+                    >
+                      {showPassword ? (
+                        <svg
+                          className="h-4 w-4"
+                          fill="none"
+                          viewBox="0 0 24 24"
+                          stroke="currentColor"
+                          strokeWidth={1.5}
+                        >
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"
+                          />
+                        </svg>
+                      ) : (
+                        <svg
+                          className="h-4 w-4"
+                          fill="none"
+                          viewBox="0 0 24 24"
+                          stroke="currentColor"
+                          strokeWidth={1.5}
+                        >
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"
+                          />
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"
+                          />
+                        </svg>
+                      )}
+                    </button>
+                    {password && !isValidPassword && (
+                      <span className="text-xs mt-1 block" style={{ color: 'var(--danger)' }}>
+                        Min 8 chars, upper, lower, number & special char required
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Forgot password link */}
+              {mode === 'login' && (
+                <div className="flex justify-end -mt-2">
+                  <button
+                    type="button"
+                    onClick={() => switchMode('forgot')}
+                    className="text-xs font-semibold cursor-pointer hover:opacity-70 transition-opacity"
+                    style={{
+                      color: 'var(--accent)',
+                      background: 'none',
+                      border: 'none',
+                      padding: 0,
+                    }}
+                  >
+                    Forgot password?
+                  </button>
+                </div>
+              )}
+
+              {/* Submit button */}
+              {mode === 'login' && (
+                <button
+                  type="submit"
+                  disabled={
+                    isLoading ||
+                    !email ||
+                    !isValidEmail ||
+                    !password ||
+                    !isValidPassword ||
+                    isLocked
+                  }
+                  className="w-full py-2.5 text-sm font-semibold rounded-xl transition-all flex items-center justify-center gap-2 cursor-pointer"
+                  style={{
+                    background: btnSuccess ? 'var(--signal-green)' : 'var(--ink)',
+                    color: 'var(--paper)',
+                    border: 'none',
+                  }}
+                >
+                  {isLoading ? (
+                    <span className="h-4 w-4 rounded-full border-2 border-[var(--paper)] border-t-transparent animate-spin" />
+                  ) : btnSuccess ? (
+                    <>
+                      <svg
+                        className="h-4 w-4"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                        stroke="currentColor"
+                        strokeWidth={2.5}
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          d="M4.5 12.75l6 6 9-13.5"
+                        />
+                      </svg>
+                      Signed in
+                    </>
+                  ) : (
+                    'Sign In'
+                  )}
+                </button>
+              )}
+
+              {/* Forgot mode submit */}
+              {mode === 'forgot' && (
+                <button
+                  type="submit"
+                  disabled={isLoading || !email || !isValidEmail}
+                  className="w-full py-2.5 text-sm font-semibold rounded-xl transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                  style={{ background: 'var(--ink)', color: 'var(--paper)', border: 'none' }}
+                >
+                  {isLoading ? (
+                    <>
+                      <span className="h-4 w-4 rounded-full border-2 border-[var(--paper)] border-t-transparent animate-spin shrink-0" />
+                      <span>Sending Reset Link...</span>
+                    </>
+                  ) : (
+                    <>
+                      <svg
+                        className="h-4 w-4 shrink-0"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                        stroke="currentColor"
+                        strokeWidth={2}
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5"
+                        />
+                      </svg>
+                      <span>Send Reset Link</span>
+                    </>
+                  )}
+                </button>
+              )}
+            </form>
+          )}
+
+          {/* Mobile: back-to-home */}
+          <div className="mt-8 flex justify-center">
+            <button
+              onClick={() => navigate('/')}
+              type="button"
+              className="text-xs font-semibold transition-all hover:opacity-70 cursor-pointer px-4 py-2 rounded-xl"
+              style={{ color: 'var(--graphite)', background: 'var(--mist)', border: 'none' }}
+            >
+              ← Back to Home
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
