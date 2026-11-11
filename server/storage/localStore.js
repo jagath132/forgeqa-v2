@@ -69,10 +69,12 @@ export function createLocalKnowledgeStore() {
       return record;
     },
 
-    async updateFile(id, patch, _userId) {
+    async updateFile(id, patch, userId) {
       const state = await readStore();
+      const existing = state.knowledge_files.find((file) => file.id === id && (!userId || file.user_id === userId));
+      if (!existing) throw new Error('File not found or access denied.');
       state.knowledge_files = state.knowledge_files.map((file) =>
-        file.id === id ? { ...file, ...patch } : file
+        file.id === id && (!userId || file.user_id === userId) ? { ...file, ...patch } : file
       );
       await writeStore(state);
       return state.knowledge_files.find((file) => file.id === id);
@@ -106,8 +108,10 @@ export function createLocalKnowledgeStore() {
       await writeStore(state);
     },
 
-    async replaceChunks(fileId, chunks, _userId) {
+    async replaceChunks(fileId, chunks, userId) {
       const state = await readStore();
+      const file = state.knowledge_files.find((item) => item.id === fileId && (!userId || item.user_id === userId));
+      if (!file) throw new Error('File not found or access denied.');
       const records = chunks.map((chunk) => ({
         id: createId(),
         file_id: fileId,
@@ -161,9 +165,11 @@ export function createLocalKnowledgeStore() {
         });
     },
 
-    async deleteFile(id, _userId) {
+    async deleteFile(id, userId) {
       const state = await readStore();
-      state.knowledge_files = state.knowledge_files.filter((file) => file.id !== id);
+      const exists = state.knowledge_files.some((file) => file.id === id && (!userId || file.user_id === userId));
+      if (!exists) throw new Error('File not found or access denied.');
+      state.knowledge_files = state.knowledge_files.filter((file) => file.id !== id || (userId && file.user_id !== userId));
       state.knowledge_chunks = state.knowledge_chunks.filter((chunk) => chunk.file_id !== id);
       await writeStore(state);
     },

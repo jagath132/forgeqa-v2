@@ -6,6 +6,13 @@ import { getDb } from '../db.js';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '15m';
 const REFRESH_EXPIRES_IN = process.env.REFRESH_EXPIRES_IN || '7d';
 
+function refreshExpiryDate() {
+  const match = /^([1-9]\d*)([smhd])$/.exec(REFRESH_EXPIRES_IN);
+  if (!match) throw new Error('REFRESH_EXPIRES_IN must be a positive duration such as 30m, 7d, or 12h');
+  const factors = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+  return new Date(Date.now() + Number(match[1]) * factors[match[2]]);
+}
+
 function getJwtSecret() {
   if (!process.env.JWT_SECRET) {
     if (process.env.NODE_ENV === 'production') {
@@ -69,7 +76,7 @@ export async function generateRefreshToken(user) {
   );
   const db = getDb();
   const hashed = hashToken(raw);
-  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  const expiresAt = refreshExpiryDate();
   await db.collection('refresh_tokens').insertOne({
     userId: user.id || user._id.toString(),
     hashedToken: hashed,

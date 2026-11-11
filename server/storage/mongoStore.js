@@ -184,9 +184,10 @@ export function createMongoKnowledgeStore() {
       const db = getDb();
       const query = { _id: new ObjectId(id) };
       if (userId) query.userId = userId;
+      const file = await db.collection('knowledge_files').findOne(query, { projection: { _id: 1 } });
+      if (!file) throw new Error('File not found or access denied.');
       await db.collection('knowledge_chunks').deleteMany({ fileId: id });
-      const result = await db.collection('knowledge_files').deleteOne(query);
-      if (!result.deletedCount) throw new Error('File not found or access denied.');
+      await db.collection('knowledge_files').deleteOne(query);
     },
 
     async searchChunks(query = '', limit = 50, userId, fileId = null, queryEmbedding = null) {

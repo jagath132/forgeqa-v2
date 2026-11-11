@@ -232,7 +232,7 @@ export interface AiChatMessage {
   content: string;
   timestamp: string;
   codeBlocks?: { language: string; code: string; title?: string }[];
-  actionData?: any;
+  actionData?: Record<string, unknown>;
 }
 
 export interface IntegrationConnector {

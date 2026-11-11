@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { api } from '../lib/api';
 import type {
   Bug,
   BugStatus,
@@ -796,39 +797,60 @@ export const useForgeStore = create<ForgeStoreState>((set, get) => ({
     }));
   },
   sendActiveRequest: async () => {
+    const state = get();
+    const request = state.apiCollections.flatMap((collection) => collection.requests)
+      .find((item) => item.id === state.activeRequestId);
+    if (!request) return;
     set({ isSendingRequest: true });
-    await new Promise((r) => setTimeout(r, 450));
-    const randomLatency = Math.floor(80 + Math.random() * 120);
-    set({
-      isSendingRequest: false,
-      activeResponse: {
-        statusCode: 200,
-        statusText: 'OK',
-        responseTimeMs: randomLatency,
-        responseSizeBytes: 2840,
-        headers: {
-          'content-type': 'application/json',
-          'x-powered-by': 'ForgeQA-Proxy-v2',
-          'date': new Date().toUTCString()
-        },
-        body: JSON.stringify({
-          success: true,
-          message: 'Request processed successfully via ForgeQA API Proxy',
-          timestamp: new Date().toISOString(),
-          environment: get().activeEnvironment,
-          data: {
-            service: 'ForgeQA Command Engine',
-            activeWorkers: 4,
-            p95Latency: randomLatency + 'ms'
-          }
-        }, null, 2),
-        timestamp: new Date().toLocaleTimeString(),
-        assertionResults: [
-          { assertion: { id: 'AS-1', type: 'STATUS_CODE', target: 'status', expected: '200' }, passed: true, actual: '200' },
-          { assertion: { id: 'AS-2', type: 'RESPONSE_TIME', target: 'responseTime', expected: '< 300ms' }, passed: true, actual: randomLatency + 'ms' }
-        ]
-      }
-    });
+    const started = performance.now();
+    try {
+      const variables = state.apiCollections.find((collection) => collection.id === request.collectionId)?.variables ?? {};
+      const interpolate = (value: string) => value.replace(/\{\{([^}]+)\}\}/g, (_, key: string) => variables[key.trim()] ?? '');
+      const url = new URL(interpolate(request.url));
+      for (const param of request.params.filter((item) => item.enabled && item.key)) url.searchParams.set(param.key, interpolate(param.value));
+      const headers = Object.fromEntries(request.headers.filter((item) => item.enabled && item.key).map((item) => [interpolate(item.key), interpolate(item.value)]));
+      if (request.authType === 'BEARER' && request.authConfig.token) headers.Authorization = `Bearer ${interpolate(request.authConfig.token)}`;
+      if (request.authType === 'API_KEY' && request.authConfig.key) headers[request.authConfig.header || 'X-API-Key'] = interpolate(request.authConfig.key);
+      if (request.authType === 'BASIC' && request.authConfig.username) headers.Authorization = `Basic ${btoa(`${interpolate(request.authConfig.username)}:${interpolate(request.authConfig.password || '')}`)}`;
+      const response = await fetch(url, {
+        method: request.method,
+        headers,
+        ...(request.method !== 'GET' && request.method !== 'HEAD' && request.bodyType !== 'NONE' && request.body
+          ? { body: interpolate(request.body) } : {}),
+      });
+      const body = await response.text();
+      const responseTimeMs = Math.round(performance.now() - started);
+      const assertions = request.assertions.map((assertion) => {
+        let actual = '';
+        if (assertion.type === 'STATUS_CODE') actual = String(response.status);
+        else if (assertion.type === 'RESPONSE_TIME') actual = `${responseTimeMs}ms`;
+        else if (assertion.type === 'BODY_CONTAINS') actual = body.includes(assertion.expected) ? assertion.expected : 'not found';
+        else if (assertion.type === 'JSON_PATH') {
+          try {
+            const parsed: unknown = JSON.parse(body);
+            actual = assertion.target.replace(/^\$\.?/, '').split('.').filter(Boolean).reduce<unknown>((value, key) => value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, parsed) as string ?? '';
+          } catch { actual = ''; }
+        }
+        const passed = assertion.type === 'RESPONSE_TIME'
+          ? responseTimeMs < (Number(assertion.expected.match(/\d+/)?.[0]) || 0)
+          : actual === assertion.expected || (assertion.type === 'BODY_CONTAINS' && actual !== 'not found');
+        return { assertion: { ...assertion, passed }, passed, actual };
+      });
+      const responseHeaders = Object.fromEntries(response.headers.entries());
+      set({ activeResponse: {
+        statusCode: response.status, statusText: response.statusText, responseTimeMs,
+        responseSizeBytes: new Blob([body]).size, headers: responseHeaders, body,
+        timestamp: new Date().toLocaleTimeString(), assertionResults: assertions,
+      } });
+    } catch (error) {
+      set({ activeResponse: {
+        statusCode: 0, statusText: 'Request failed', responseTimeMs: Math.round(performance.now() - started),
+        responseSizeBytes: 0, headers: {}, body: error instanceof Error ? error.message : 'Request failed',
+        timestamp: new Date().toLocaleTimeString(), assertionResults: [],
+      } });
+    } finally {
+      set({ isSendingRequest: false });
+    }
   },
   addApiRequest: (collectionId, reqData) => {
     const newReq: ApiRequest = {
@@ -861,7 +883,7 @@ export const useForgeStore = create<ForgeStoreState>((set, get) => ({
       scripts: state.scripts.map((s) => (s.id === id ? { ...s, code } : s))
     }));
   },
-  runAutomationScript: async (id) => {
+  runAutomationScript: async (_id) => {
     set({ isRunningAutomation: true, terminalLogs: ['[ForgeQA Runner] Starting script execution...'] });
     const logSteps = [
       '-> Compiling TypeScript specifications...',
@@ -909,8 +931,15 @@ export const useForgeStore = create<ForgeStoreState>((set, get) => ({
   securityScore: 78,
   runSecurityScan: async () => {
     set({ isSecurityScanRunning: true });
-    await new Promise((r) => setTimeout(r, 1800));
-    set({ isSecurityScanRunning: false, securityScore: 84 });
+    try {
+      const response = await api.post('/api/security/scan', {});
+      const result = response.data as { securityScore?: number };
+      set({ ...(typeof result.securityScore === 'number' ? { securityScore: result.securityScore } : {}) });
+    } catch (error) {
+      console.error('Security scan failed:', error);
+    } finally {
+      set({ isSecurityScanRunning: false });
+    }
   },
   updateVulnerabilityStatus: (id, status) => {
     set((state) => ({

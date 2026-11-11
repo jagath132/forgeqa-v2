@@ -24,10 +24,10 @@ import {
 import {
   generateTestScript,
   generateFrameworkProject,
-  generatePlaywrightFramework,
   diagnoseTestFailure,
 } from './test-scripts/generator.js';
 import { generateRegressionScripts } from './regression/scripts.js';
+import { generateRegressionTestCases } from './regression/generator.js';
 import { crawlWebApp } from './prd/crawler.js';
 import {
   buildPrdPromptFromText,
@@ -451,12 +451,6 @@ export function createApiMiddleware(env = {}) {
       return;
     }
 
-    // ForgeQA v2.0 Modular Route Dispatcher
-    if (url.pathname.startsWith('/api/bugs') || url.pathname.startsWith('/api/api-client') || url.pathname.startsWith('/api/security/scan') || url.pathname.startsWith('/api/v2/assistant')) {
-      const handled = handleV2Routes(req, res, url, body);
-      if (handled) return;
-    }
-
     if (!url.pathname.startsWith('/api/')) {
       next();
       return;
@@ -494,6 +488,14 @@ export function createApiMiddleware(env = {}) {
         });
       }
       return;
+    }
+
+    // Dispatch legacy v2 routes only after DB readiness and parse bodies for
+    // the specific routes that need them.
+    if (url.pathname.startsWith('/api/bugs') || url.pathname.startsWith('/api/api-client') || url.pathname.startsWith('/api/security/scan') || url.pathname.startsWith('/api/v2/assistant')) {
+      const rawBody = ['POST', 'PUT', 'PATCH'].includes(req.method) ? await readRequestBody(req) : '';
+      const handled = handleV2Routes(req, res, url, rawBody ? JSON.parse(rawBody) : {});
+      if (handled) return;
     }
 
     try {

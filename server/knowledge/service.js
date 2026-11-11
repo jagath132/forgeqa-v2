@@ -106,13 +106,34 @@ export function createKnowledgeService(store, env = {}) {
         throw new Error('Only SharePoint domains are allowed.');
       }
 
+      const isAllowedHost = (hostname) => {
+        const host = hostname.toLowerCase().replace(/\.$/, '');
+        return host.endsWith('.sharepoint.com') || host.endsWith('.sharepoint.cn');
+      };
+
       const headers = {};
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 15000);
 
       try {
-        const response = await fetch(url, { headers, signal: controller.signal });
+        let requestUrl = parsed;
+        let response;
+        for (let redirects = 0; redirects <= 3; redirects += 1) {
+          if (!isAllowedHost(requestUrl.hostname)) throw new Error('SharePoint redirected to an unapproved host.');
+          response = await fetch(requestUrl, { headers, signal: controller.signal, redirect: 'manual' });
+          if (![301, 302, 303, 307, 308].includes(response.status)) break;
+          const location = response.headers.get('location');
+          if (!location || redirects === 3) throw new Error('SharePoint redirect limit exceeded.');
+          requestUrl = new URL(location, requestUrl);
+          if (requestUrl.protocol !== 'https:' || !isAllowedHost(requestUrl.hostname)) {
+            throw new Error('SharePoint redirected to an unapproved URL.');
+          }
+        }
         clearTimeout(timeout);
+
+        const contentLength = Number(response.headers.get('content-length') || 0);
+        const maxBytes = 25 * 1024 * 1024;
+        if (contentLength > maxBytes) throw new Error('SharePoint document exceeds the 25 MB limit.');
 
         if (!response.ok) {
           throw new Error(
@@ -120,8 +141,14 @@ export function createKnowledgeService(store, env = {}) {
           );
         }
 
-        const arrayBuffer = await response.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
+        const parts = [];
+        let totalBytes = 0;
+        for await (const part of response.body) {
+          totalBytes += part.length;
+          if (totalBytes > maxBytes) throw new Error('SharePoint document exceeds the 25 MB limit.');
+          parts.push(part);
+        }
+        const buffer = Buffer.concat(parts);
         const fileName = decodeURIComponent(
           url.split('/').pop()?.split('?')[0] || 'sharepoint-document'
         );

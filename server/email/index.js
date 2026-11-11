@@ -121,7 +121,7 @@ export async function sendProductKeyEmail(to, productKey, customerName) {
   if (transport) {
     try {
       await transport.sendMail({
-        from: `"${BRAND}" <${FROM_EMAIL}>`,
+        from: `"${getSenderName()}" <${getFromEmail()}>`,
         to,
         subject: 'Your ForgeQA Product Key — Complete Registration',
         html,
@@ -165,13 +165,13 @@ export async function sendSupportEmail({ name, email, subject, message }) {
     '<tr><td style="padding:0 32px 32px">',
     '<table width="100%" cellpadding="0" cellspacing="0">',
     '<tr><td style="padding:8px 0"><span style="color:#6b6b8a;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:1px">Name</span></td></tr>',
-    `<tr><td style="padding:0 0 12px;color:#ededf5;font-size:14px">${name}</td></tr>`,
+    `<tr><td style="padding:0 0 12px;color:#ededf5;font-size:14px">${escapeHtml(name)}</td></tr>`,
     '<tr><td style="padding:8px 0"><span style="color:#6b6b8a;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:1px">Email</span></td></tr>',
-    `<tr><td style="padding:0 0 12px;color:#ededf5;font-size:14px">${email}</td></tr>`,
+    `<tr><td style="padding:0 0 12px;color:#ededf5;font-size:14px">${escapeHtml(email)}</td></tr>`,
     '<tr><td style="padding:8px 0"><span style="color:#6b6b8a;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:1px">Subject</span></td></tr>',
-    `<tr><td style="padding:0 0 12px;color:#ededf5;font-size:14px">${subject || 'Support Request'}</td></tr>`,
+    `<tr><td style="padding:0 0 12px;color:#ededf5;font-size:14px">${escapeHtml(subject || 'Support Request')}</td></tr>`,
     '<tr><td style="padding:8px 0"><span style="color:#6b6b8a;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:1px">Message</span></td></tr>',
-    `<tr><td style="padding:0 0 12px;color:#ededf5;font-size:14px;line-height:1.6">${message}</td></tr>`,
+    `<tr><td style="padding:0 0 12px;color:#ededf5;font-size:14px;line-height:1.6">${escapeHtml(message).replace(/\r?\n/g, '<br>')}</td></tr>`,
     '</table></td></tr></table>',
     '<p style="color:#4a4a5a;font-size:11px;margin-top:24px">',
     `&copy; ${new Date().getFullYear()} ForgeQA. All rights reserved.</p>`,
@@ -182,7 +182,7 @@ export async function sendSupportEmail({ name, email, subject, message }) {
   if (transport) {
     try {
       await transport.sendMail({
-        from: `"${BRAND}" <${FROM_EMAIL}>`,
+        from: `"${getSenderName()}" <${getFromEmail()}>`,
         to: adminEmail,
         replyTo: email,
         subject: `[Support] ${subject || 'Support Request'} — from ${name}`,
@@ -200,4 +200,10 @@ export async function sendSupportEmail({ name, email, subject, message }) {
     `⚠️ No active real email transport configured. Support message from ${email} logged.`
   );
   return false;
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[char]);
 }

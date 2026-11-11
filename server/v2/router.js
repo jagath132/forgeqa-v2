@@ -60,64 +60,22 @@ export function handleV2Routes(req, res, url, body) {
 
   // 2. API Testing Client Proxy (/api/api-client/proxy)
   if (url.pathname === '/api/api-client/proxy' && req.method === 'POST') {
-    const reqData = typeof body === 'string' ? JSON.parse(body || '{}') : body;
-    const latency = Math.floor(60 + Math.random() * 90);
-    res.statusCode = 200;
-    res.end(JSON.stringify({
-      statusCode: 200,
-      statusText: 'OK',
-      responseTimeMs: latency,
-      responseSizeBytes: 2048,
-      headers: {
-        'content-type': 'application/json',
-        'x-forgeqa-engine': 'v2-cloud-proxy'
-      },
-      body: JSON.stringify({
-        status: 'success',
-        forwardedTo: reqData.url || 'localhost',
-        method: reqData.method || 'GET',
-        timestamp: new Date().toISOString()
-      }, null, 2),
-      assertionResults: [
-        { type: 'STATUS_CODE', expected: '200', actual: '200', passed: true },
-        { type: 'RESPONSE_TIME', expected: '< 300ms', actual: latency + 'ms', passed: true }
-      ]
-    }));
+    res.statusCode = 501;
+    res.end(JSON.stringify({ error: 'Server-side API proxying is not available. Configure a CORS-enabled target and send the request from the client.' }));
     return true;
   }
 
   // 3. Security OWASP Scan (/api/security/scan)
   if (url.pathname === '/api/security/scan' && req.method === 'POST') {
-    res.statusCode = 200;
-    res.end(JSON.stringify({
-      success: true,
-      securityScore: 84,
-      profile: 'OWASP_TOP_10_ACTIVE',
-      vulnerabilitiesFound: 2,
-      findings: [
-        {
-          id: 'SEC-801',
-          title: 'Reflected Cross-Site Scripting (XSS) in Search Filter',
-          severity: 'HIGH',
-          cvssScore: 7.4,
-          endpoint: '/api/search'
-        }
-      ]
-    }));
+    res.statusCode = 501;
+    res.end(JSON.stringify({ error: 'Active security scanning is not implemented. No scan was performed.' }));
     return true;
   }
 
   // 4. Forge AI Assistant QA Endpoint (/api/v2/assistant)
   if (url.pathname === '/api/v2/assistant' && req.method === 'POST') {
-    const payload = typeof body === 'string' ? JSON.parse(body || '{}') : body;
-    const prompt = payload.prompt || '';
-    res.statusCode = 200;
-    res.end(JSON.stringify({
-      success: true,
-      reply: 'Forge Assistant analyzed: ' + prompt,
-      model: 'gemini-2.5-flash-qa',
-      timestamp: new Date().toISOString()
-    }));
+    res.statusCode = 501;
+    res.end(JSON.stringify({ error: 'This assistant endpoint is not connected to an AI provider.' }));
     return true;
   }
 
